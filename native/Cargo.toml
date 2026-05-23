@@ -1,0 +1,50 @@
+[package]
+name = "mutsurelay_native"
+version = "0.1.0"
+description = "MutsuRelay native library — ASR, Bilibili API, audio capture"
+edition = "2021"
+license = "Apache-2.0"
+
+[lib]
+name = "mutsurelay_native"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+env_logger = "0.11"
+dirs = "6"
+toml = "0.8"
+
+# Audio
+cpal = "0.15"
+
+# Bilibili
+reqwest = { version = "0.12", features = ["json", "cookies"] }
+qrcode = "0.14"
+
+# ASR (sherpa-onnx is heavy; features = ["shared"] for dynamic linking)
+sherpa-onnx = { version = "1.13", default-features = false, features = ["shared"], optional = true }
+
+# Model download
+ureq = "2.12"
+flate2 = "1.1"
+bzip2 = "0.4"
+tar = "0.4"
+
+# Content filtering
+pinyin = "0.10"
+
+# Async runtime
+tokio = { version = "1", features = ["full"], optional = true }
+
+[features]
+default = ["asr", "async"]
+asr = ["sherpa-onnx"]
+async = ["tokio"]
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
