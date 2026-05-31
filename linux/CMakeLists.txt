@@ -4,10 +4,10 @@ project(runner LANGUAGES CXX)
 
 # The name of the executable created for the application. Change this to change
 # the on-disk name of your application.
-set(BINARY_NAME "mutsurelay_flutter")
+set(BINARY_NAME "mutsurelay")
 # The unique GTK application identifier for this application. See:
 # https://wiki.gnome.org/HowDoI/ChooseApplicationID
-set(APPLICATION_ID "com.example.mutsurelay_flutter")
+set(APPLICATION_ID "com.mutsurelay.app")
 
 # Explicitly opt in to modern CMake behaviors to avoid warnings with recent
 # versions of CMake.
@@ -144,3 +144,8 @@ setup_native_and_model(
     "libonnxruntime.so"
     "libonnxruntime_providers_shared.so"
 )
+
+# Install blocklist.txt alongside the executable (Rust expects <exe>/asr/blocklist.txt)
+install(FILES "${PROJECT_ROOT}/asr/blocklist.txt"
+        DESTINATION "${CMAKE_INSTALL_PREFIX}/asr"
+        OPTIONAL COMPONENT Runtime)

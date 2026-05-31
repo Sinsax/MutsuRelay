@@ -46,37 +46,65 @@ pub fn censor(text: &str, mode: i32) -> String {
     }
 
     let chars: Vec<char> = text.chars().collect();
-    let mut result = String::with_capacity(text.len());
-    let mut i = 0;
-    while i < chars.len() {
-        let mut matched = false;
-        for word in &words {
-            if word.is_empty() {
-                continue;
-            }
-            let word_chars: Vec<char> = word.chars().collect();
-            let wlen = word_chars.len();
-            if i + wlen > chars.len() {
-                continue;
-            }
-            if chars[i..i + wlen] != word_chars[..] {
-                continue;
-            }
+    let n = chars.len();
+    if n == 0 {
+        return String::new();
+    }
 
-            let replacement = if mode == 2 {
-                to_initials(word)
+    // Phase 1: find all match positions (start, end) for all words
+    let mut matches: Vec<(usize, usize)> = Vec::new();
+    for word in &words {
+        if word.is_empty() {
+            continue;
+        }
+        let wc: Vec<char> = word.chars().collect();
+        let wlen = wc.len();
+        if wlen > n {
+            continue;
+        }
+        for i in 0..=n - wlen {
+            if chars[i..i + wlen] == wc[..] {
+                matches.push((i, i + wlen));
+            }
+        }
+    }
+    if matches.is_empty() {
+        return text.to_string();
+    }
+
+    // Phase 2: sort by start position, then merge overlapping spans
+    matches.sort_unstable();
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in matches {
+        if let Some(last) = spans.last_mut() {
+            if s <= last.1 {
+                last.1 = last.1.max(e);
             } else {
-                "[***]".to_string()
-            };
-            result.push_str(&replacement);
-            i += wlen;
-            matched = true;
-            break;
+                spans.push((s, e));
+            }
+        } else {
+            spans.push((s, e));
         }
-        if !matched {
-            result.push(chars[i]);
-            i += 1;
+    }
+
+    // Phase 3: build result, replacing each span
+    let mut result = String::with_capacity(text.len());
+    let mut pos = 0;
+    for (start, end) in spans {
+        for &c in &chars[pos..start] {
+            result.push(c);
         }
+        let span_text: String = chars[start..end].iter().collect();
+        let replacement = if mode == 2 {
+            to_initials(&span_text)
+        } else {
+            "[***]".to_string()
+        };
+        result.push_str(&replacement);
+        pos = end;
+    }
+    for &c in &chars[pos..] {
+        result.push(c);
     }
     result
 }
@@ -105,4 +133,56 @@ pub fn reload_blocklist() {
         *w = loaded;
     }
     log::info!("Blocklist reloaded");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup(words: Vec<&str>) {
+        if let Ok(mut w) = BLOCKLIST.lock() {
+            *w = words.iter().map(|s| s.to_string()).collect();
+        }
+    }
+
+    #[test]
+    fn test_overlap_pinyin() {
+        setup(vec!["操你", "你妈"]);
+        assert_eq!(censor("操你妈", 2), "cnm");
+    }
+
+    #[test]
+    fn test_overlap_asterisk() {
+        setup(vec!["操你", "你妈"]);
+        assert_eq!(censor("操你妈", 1), "[***]");
+    }
+
+    #[test]
+    fn test_non_overlap() {
+        setup(vec!["傻逼", "废物"]);
+        assert_eq!(censor("你个傻逼废物", 2), "你个sbfw");
+    }
+
+    #[test]
+    fn test_mode_off() {
+        assert_eq!(censor("操你妈", 0), "操你妈");
+    }
+
+    #[test]
+    fn test_no_match() {
+        setup(vec!["操你", "你妈"]);
+        assert_eq!(censor("你好世界", 2), "你好世界");
+    }
+
+    #[test]
+    fn test_adjacent_merge() {
+        setup(vec!["操你", "娘逼"]);
+        assert_eq!(censor("操你娘逼", 2), "cnnb");
+    }
+
+    #[test]
+    fn test_multi_overlap() {
+        setup(vec!["操你妈", "你妈逼"]);
+        assert_eq!(censor("操你妈逼", 2), "cnmb");
+    }
 }

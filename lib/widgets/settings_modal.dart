@@ -327,7 +327,13 @@ class SettingsModal extends StatelessWidget {
     return _settingsRow('配置文件-字幕文件', _actionBtn('打开文件夹', () {
       final path = NativeBridge.instance.getConfigDirPath();
       if (path != null) {
-        Process.run('explorer', [path]);
+        if (Platform.isLinux) {
+          Process.run('xdg-open', [path]);
+        } else if (Platform.isMacOS) {
+          Process.run('open', [path]);
+        } else {
+          Process.run('explorer', [path]);
+        }
       }
     }));
   }

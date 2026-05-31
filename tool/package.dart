@@ -93,7 +93,7 @@ Future<void> _packageLinux(String version) async {
 
   print('\n=== Creating AppImage ===');
   final bundleDir = 'build/linux/x64/release/bundle';
-  const binaryName = 'mutsurelay_flutter';
+  const binaryName = 'mutsurelay';
   const displayName = 'MutsuRelay';
 
   // Create AppRun entry point
@@ -130,6 +130,42 @@ Future<void> _packageLinux(String version) async {
   final env = Map<String, String>.from(Platform.environment)
     ..['APPIMAGE_EXTRACT_AND_RUN'] = '1';
   await _run('appimagetool', [bundleDir, outPath], env: env);
+
+  // tar.gz portable package
+  print('\n=== Creating tar.gz package ===');
+  final stageName = 'MutsuRelay-$version';
+  final stageDir = 'build/linux/x64/release/targz/$stageName';
+  if (Directory(stageDir).existsSync()) {
+    Directory(stageDir).deleteSync(recursive: true);
+  }
+  Directory(stageDir).createSync(recursive: true);
+
+  // Copy bundle contents
+  await _run('cp', ['-r', '$bundleDir/.', stageDir]);
+
+  // Create run script (same logic as AppRun but named for manual extraction)
+  final runScript = File('$stageDir/run.sh');
+  await runScript.writeAsString(
+    '#!/bin/bash\n'
+    'HERE="\$(dirname "\$(readlink -f "\$0")")"\n'
+    'cd "\$HERE"\n'
+    'export LD_LIBRARY_PATH="\$HERE/lib:\$LD_LIBRARY_PATH"\n'
+    'exec "./$binaryName" "\$@"\n',
+  );
+  await Process.run('chmod', ['+x', runScript.path]);
+
+  final targzPath = 'dist/MutsuRelay-$version.tar.gz';
+  final result = await Process.run('tar', [
+    '-czf', targzPath,
+    '-C', 'build/linux/x64/release/targz',
+    stageName,
+  ]);
+  Directory('build/linux/x64/release/targz').deleteSync(recursive: true);
+
+  if (result.exitCode != 0) {
+    stderr.writeln('tar.gz creation failed: ${result.stderr}');
+    exit(1);
+  }
 
   print('\nOutputs:');
   await for (final f in outDir.list()) {

@@ -32,7 +32,7 @@
 ## 项目结构
 
 ```text
-mutsurelay_flutter/
+mutsurelay/
 ├── lib/                    # Flutter 界面与 FFI 调用
 │   ├── ffi/                # native_bridge.dart
 │   ├── providers/          # AppState
