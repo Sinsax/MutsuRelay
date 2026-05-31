@@ -58,7 +58,7 @@ Uint8List _buildIcoFromBgra(Uint8List bgra, int w, int h) {
 Future<String> _generateTrayIconPath() async {
   // Linux: appindicator expects PNG, not ICO
   if (Platform.isLinux) {
-    final data = await rootBundle.load('assets/logo_tr.png');
+    final data = await rootBundle.load('assets/logo.png');
     final pngFile = File('${Directory.systemTemp.path}/mutsurelay_tray.png');
     await pngFile.writeAsBytes(data.buffer.asUint8List());
     return pngFile.path;
@@ -67,7 +67,7 @@ Future<String> _generateTrayIconPath() async {
   // Windows: LoadImage(IMAGE_ICON) requires .ico
   Uint8List icoBytes;
   try {
-    final data = await rootBundle.load('assets/logo_tr.png');
+    final data = await rootBundle.load('assets/logo.png');
     final pngBytes = data.buffer.asUint8List(data.offsetInBytes, data.lengthInBytes);
     final codec = await ui.instantiateImageCodec(pngBytes, targetWidth: 32, targetHeight: 32);
     final frame = await codec.getNextFrame();
