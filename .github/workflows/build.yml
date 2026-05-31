@@ -144,5 +144,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: mutsurelay-linux-x64-appimage
-          path: "*.AppImage"
-          compression-level: 0
+          path: |
+            **/*.AppImage
+            dist/**/*
