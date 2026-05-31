@@ -135,7 +135,7 @@ endif()
 setup_native_and_model(
   TARGET       ${BINARY_NAME}
   PROJECT_ROOT "${PROJECT_ROOT}"
-  MODEL_DEST   "${INSTALL_BUNDLE_LIB_DIR}/asr/model"
+  MODEL_DEST   "${CMAKE_INSTALL_PREFIX}/asr/model"
   LIB_DEST     "${INSTALL_BUNDLE_LIB_DIR}"
   LIB_NAME     "libmutsurelay_native.so"
   RUNTIME_DEPS

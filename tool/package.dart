@@ -120,7 +120,7 @@ Future<void> _packageLinux(String version) async {
   );
 
   // Copy icon
-  final icon = File('assets/logo_tr.png');
+  final icon = File('assets/logo.png');
   if (await icon.exists()) {
     await icon.copy('$bundleDir/$binaryName.png');
   }
