@@ -220,8 +220,6 @@ void main() async {
     final candidates = <String>[];
     if (Platform.isWindows) {
       candidates.add('asr/model');
-    } else if (Platform.isLinux) {
-      candidates.add('lib/asr/model');
     } else if (Platform.isMacOS) {
       candidates.add('../Resources/asr/model');
     }
