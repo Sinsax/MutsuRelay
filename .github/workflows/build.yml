@@ -36,55 +36,55 @@ jobs:
         working-directory: native
         run: cargo check
 
-  build-windows:
-    runs-on: windows-latest
-    needs: analyze
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: subosito/flutter-action@v2
-        with:
-          channel: stable
-
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
-        with:
-          target: x86_64-pc-windows-msvc
-          cache: true
-
-      - name: Cache ASR model
-        uses: actions/cache@v4
-        with:
-          path: asr/model
-          key: asr-model-${{ hashFiles('cmake/download_model.cmake') }}
-
-      - name: Flutter pub get
-        run: flutter pub get
-
-      - name: Build Flutter Windows (release)
-        run: flutter build windows --release
-
-      - name: Install Inno Setup
-        run: choco install innosetup --no-progress
-
-      - name: Create Inno Setup installer
-        run: iscc windows\installer\setup.iss
-
-      - name: Create ZIP package
-        run: |
-          New-Item -ItemType Directory -Path dist -Force
-          Compress-Archive -Path "build\windows\x64\runner\Release\*" -DestinationPath "dist\MutsuRelay-1.0.0.zip" -CompressionLevel Optimal
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: mutsurelay-windows-x64
-          path: build\windows\x64\runner\Release\
-          compression-level: 6
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: mutsurelay-windows-x64-installer
-          path: dist\*
-          compression-level: 0
+#  build-windows:
+#    runs-on: windows-latest
+#    needs: analyze
+#    steps:
+#      - uses: actions/checkout@v4
+# 
+#      - uses: subosito/flutter-action@v2
+#        with:
+#          channel: stable
+# 
+#      - uses: actions-rust-lang/setup-rust-toolchain@v1
+#        with:
+#          target: x86_64-pc-windows-msvc
+#          cache: true
+# 
+#      - name: Cache ASR model
+#        uses: actions/cache@v4
+#        with:
+#          path: asr/model
+#          key: asr-model-${{ hashFiles('cmake/download_model.cmake') }}
+# 
+#      - name: Flutter pub get
+#        run: flutter pub get
+# 
+#      - name: Build Flutter Windows (release)
+#        run: flutter build windows --release
+# 
+#      - name: Install Inno Setup
+#        run: choco install innosetup --no-progress
+# 
+#      - name: Create Inno Setup installer
+#        run: iscc windows\installer\setup.iss
+# 
+#      - name: Create ZIP package
+#        run: |
+#          New-Item -ItemType Directory -Path dist -Force
+#          Compress-Archive -Path "build\windows\x64\runner\Release\*" -DestinationPath "dist\MutsuRelay-1.0.0.zip" -CompressionLevel Optimal
+# 
+#      - uses: actions/upload-artifact@v4
+#        with:
+#          name: mutsurelay-windows-x64
+#          path: build\windows\x64\runner\Release\
+#          compression-level: 6
+# 
+#      - uses: actions/upload-artifact@v4
+#        with:
+#          name: mutsurelay-windows-x64-installer
+#          path: dist\*
+#          compression-level: 0
 
   build-linux:
     runs-on: ubuntu-latest

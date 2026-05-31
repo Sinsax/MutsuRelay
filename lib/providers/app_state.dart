@@ -545,9 +545,6 @@ class AppState extends ChangeNotifier {
     }
     final exeDir = File(Platform.resolvedExecutable).parent;
     final candidates = <String>[];
-    if (Platform.isLinux) {
-      candidates.add('lib/asr/model');
-    }
     candidates.addAll(['asr/model', '../asr/model', '../../asr/model']);
     for (final dir in candidates) {
       final p = '${exeDir.path}/$dir';
