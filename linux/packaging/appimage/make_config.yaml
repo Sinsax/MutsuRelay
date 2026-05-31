@@ -1,0 +1,6 @@
+display_name: MutsuRelay
+icon: assets/logo_tr.png
+categories:
+  - Audio
+  - Utility
+startup_notify: true

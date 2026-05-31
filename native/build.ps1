@@ -77,6 +77,15 @@ try {
         Write-Host "Bundled ASR model to $buildModelDir" -ForegroundColor Green
     }
 
+    # Bundle blocklist.txt into build output
+    $blocklistSrc = Join-Path $ProjectRoot "..\asr\blocklist.txt"
+    if (Test-Path $blocklistSrc) {
+        $buildAsrDir = Join-Path $flutterBuildDir "asr"
+        New-Item -ItemType Directory -Path $buildAsrDir -Force | Out-Null
+        Copy-Item -Path $blocklistSrc -Destination (Join-Path $buildAsrDir "blocklist.txt") -Force
+        Write-Host "Bundled blocklist to $buildAsrDir" -ForegroundColor Green
+    }
+
     Write-Host "=== Build complete ===" -ForegroundColor Cyan
 } finally {
     Pop-Location

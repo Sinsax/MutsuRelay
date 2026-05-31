@@ -12,8 +12,9 @@
 - 小窗模式：窗口置顶，可通过滑块调节整体透明度
 - OBS 捕捉：识别结果写入 `capture.txt`，可供 OBS 文本源读取
 - 脏话过滤：支持关闭、替换为 `[***]`、替换为拼音首字母
-- 噪声控制：提供噪声门限与降噪开关，降低环境噪音影响
+- 噪声控制：提供噪声门限（灵敏度可调）与降噪开关，降低环境噪音影响
 - 托盘驻留：关闭窗口可隐藏到托盘，也可设置为直接退出
+- 文件直达：设置中一键打开配置目录和字幕文件位置
 
 ## 技术栈
 
@@ -32,16 +33,21 @@
 
 ```text
 mutsurelay_flutter/
-├── lib/                  # Flutter 界面与 FFI 调用
-│   ├── ffi/              # native_bridge.dart
-│   ├── providers/        # AppState
-│   ├── screens/          # 主界面 / 小窗界面
-│   └── widgets/          # 控件
-├── native/               # Rust 原生库：ASR、录音、B站、过滤
-├── windows/              # Flutter Windows runner
-├── linux/                # Flutter Linux runner
-├── asr/                  # 本地 ASR 模型与运行库，需自行放置
-└── pubspec.yaml
+├── lib/                    # Flutter 界面与 FFI 调用
+│   ├── ffi/                # native_bridge.dart
+│   ├── providers/          # AppState
+│   ├── screens/            # 主界面 / 小窗界面
+│   └── widgets/            # 控件
+├── native/                 # Rust 原生库：ASR、录音、B站、过滤
+├── windows/                # Flutter Windows runner (CMake)
+│   └── installer/          # Inno Setup 安装脚本
+├── linux/                  # Flutter Linux runner (CMake)
+│   └── packaging/          # AppImage 打包配置
+├── cmake/                  # 共享 CMake 模块（模型下载 + Rust 构建）
+├── tool/                   # 开发工具脚本
+├── asr/                    # ASR 模型（CMake 自动下载）
+├── dist/                   # 打包产物输出目录（.exe / .zip / .AppImage）
+└── pubspec.yaml            # 版本号唯一来源（1.0.0+1）
 ```
 
 ## 构建与运行
@@ -51,47 +57,67 @@ mutsurelay_flutter/
 - Flutter SDK
 - Rust 工具链
 - Windows：Visual Studio 2022 Build Tools / Windows SDK
-- ASR 模型文件与 sherpa-onnx 运行库
+- Linux：`clang libclang-dev libgtk-3-dev libasound2-dev liblz4-dev pkg-config`
+- 打包（可选）：Inno Setup 6（`winget install JRSoftware.InnoSetup`）
 
-### 准备 ASR 文件
+版本号统一在 `pubspec.yaml` 中管理（`version: 1.0.0+1`），构建时自动写入 EXE 元数据和安装包文件名。
 
-将 SenseVoice 模型放到 `asr/model/`：
+### 一键构建
 
-- `model.int8.onnx`
-- `tokens.txt`
+CMake 会自动下载 ASR 模型（~200MB）+ 编译 Rust 原生库 + 打包所有文件：
 
-将 sherpa-onnx 运行时库放到 `asr/dll/`，或放到系统可搜索的动态库路径中。模型与 DLL 体积较大，默认不提交到 git。
+```bash
+flutter build windows --release   # Windows
+flutter build linux --release     # Linux
+```
 
-### 构建原生库
+无需手动准备模型或运行库。
 
-Windows 可使用：
+### 快速迭代（跳过 CMake）
 
+先构建 Rust 原生库，再启动 Flutter（二选一）：
+
+**一步到位（推荐，跨平台）：**
+```bash
+dart run tool/build_and_run.dart
+```
+
+**分步执行：**
 ```powershell
-cd native
-.\build.ps1
-```
-
-脚本会构建 `mutsurelay_native.dll`，并复制到 Flutter Windows runner 可加载的位置。
-
-也可以手动构建：
-
-```bash
-cd native
-cargo build --release
-```
-
-### 启动 Flutter
-
-```bash
-flutter pub get
+# Windows
+native\build.ps1                  # cargo build + 复制 DLL
 flutter run -d windows
-```
 
-Linux 调试时将目标改为：
-
-```bash
+# Linux
+bash native/build.sh
 flutter run -d linux
 ```
+
+### 一键打包（推荐）
+
+全平台自动检测，一步完成构建+打包：
+
+```bash
+dart run tool/package.dart
+```
+
+Windows 产出 `dist/MutsuRelay-<version>.zip` + `dist/MutsuRelay-<version>-setup.exe`。
+Linux 产出 `*.AppImage`。
+
+### 分步打包
+
+```powershell
+# Windows Inno Setup 安装包（可选路径、开始菜单、卸载）
+iscc windows\installer\setup.iss
+
+# Windows 便携 ZIP（解压即用）
+Compress-Archive -Path "build\windows\x64\runner\Release\*" -DestinationPath "dist\MutsuRelay.zip"
+
+# Linux AppImage
+dart run fastforge package --platform linux --targets appimage
+```
+
+CI 会在每次推送时自动执行完整构建+打包流程，产物可在 Action 页面下载。
 
 ## 使用
 
@@ -111,7 +137,7 @@ flutter run -d linux
 | `capture.txt` | OBS 文本源可读取的识别结果 |
 | `blocklist.txt` | 自定义过滤词表 |
 
-OBS 集成方式：添加文本源，启用从文件读取，选择配置目录中的 `capture.txt`。
+OBS 集成方式：添加文本源，启用从文件读取，选择配置目录中的 `capture.txt`。也可以在设置中点击「字幕文件 → 打开文件」直达 `capture.txt` 位置。
 
 ## 常见问题
 

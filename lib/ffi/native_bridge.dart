@@ -120,6 +120,18 @@ typedef MutsuRelayGetRecognitionResultDart = Pointer<Utf8> Function();
 typedef MutsuRelayDownloadAsrModelC = Int32 Function(Pointer<Utf8> url, Pointer<Utf8> destDir);
 typedef MutsuRelayDownloadAsrModelDart = int Function(Pointer<Utf8> url, Pointer<Utf8> destDir);
 
+typedef MutsuRelaySetSubtitleFilePathC = Void Function(Pointer<Utf8> path);
+typedef MutsuRelaySetSubtitleFilePathDart = void Function(Pointer<Utf8> path);
+
+typedef MutsuRelayGetSubtitleFilePathC = Pointer<Utf8> Function();
+typedef MutsuRelayGetSubtitleFilePathDart = Pointer<Utf8> Function();
+
+typedef MutsuRelaySetMemorySensitivityC = Void Function(Double val);
+typedef MutsuRelaySetMemorySensitivityDart = void Function(double val);
+
+typedef MutsuRelayGetMemorySensitivityC = Double Function();
+typedef MutsuRelayGetMemorySensitivityDart = double Function();
+
 // ---- Native Bridge ----
 
 class NativeBridge {
@@ -170,7 +182,10 @@ class NativeBridge {
     } else if (Platform.isLinux) {
       candidates.addAll([
         'libmutsurelay_native.so',
+        'lib/libmutsurelay_native.so',
         'linux/libmutsurelay_native.so',
+        'linux/mutsurelay_native/libmutsurelay_native.so',
+        'native/target/release/libmutsurelay_native.so',
       ]);
     } else if (Platform.isMacOS) {
       candidates.addAll([
@@ -224,6 +239,10 @@ class NativeBridge {
   late MutsuRelayGetAudioLevelDart _getAudioLevel;
   late MutsuRelayGetRecognitionResultDart _getRecognitionResult;
   late MutsuRelayDownloadAsrModelDart _downloadAsrModel;
+  late MutsuRelaySetSubtitleFilePathDart _setSubtitleFilePath;
+  late MutsuRelayGetSubtitleFilePathDart _getSubtitleFilePath;
+  late MutsuRelaySetMemorySensitivityDart _setMemorySensitivity;
+  late MutsuRelayGetMemorySensitivityDart _getMemorySensitivity;
 
   void _bindFunctions() {
     _init = _lib.lookupFunction<MutsuRelayInitC, MutsuRelayInitDart>(
@@ -388,6 +407,26 @@ class NativeBridge {
           MutsuRelayDownloadAsrModelC,
           MutsuRelayDownloadAsrModelDart
         >('mutsurelay_download_asr_model');
+    _setSubtitleFilePath = _lib
+        .lookupFunction<
+          MutsuRelaySetSubtitleFilePathC,
+          MutsuRelaySetSubtitleFilePathDart
+        >('mutsurelay_set_subtitle_file_path');
+    _getSubtitleFilePath = _lib
+        .lookupFunction<
+          MutsuRelayGetSubtitleFilePathC,
+          MutsuRelayGetSubtitleFilePathDart
+        >('mutsurelay_get_subtitle_file_path');
+    _setMemorySensitivity = _lib
+        .lookupFunction<
+          MutsuRelaySetMemorySensitivityC,
+          MutsuRelaySetMemorySensitivityDart
+        >('mutsurelay_set_memory_sensitivity');
+    _getMemorySensitivity = _lib
+        .lookupFunction<
+          MutsuRelayGetMemorySensitivityC,
+          MutsuRelayGetMemorySensitivityDart
+        >('mutsurelay_get_memory_sensitivity');
   }
 
   // ---- Public API (with null safety when not loaded) ----
@@ -612,6 +651,31 @@ class NativeBridge {
       calloc.free(dirPtr);
     }
   }
+
+  void setSubtitleFilePath(String path) {
+    if (!_initialized) return;
+    final ptr = path.toNativeUtf8();
+    try {
+      _setSubtitleFilePath(ptr);
+    } finally {
+      calloc.free(ptr);
+    }
+  }
+
+  String? getSubtitleFilePath() {
+    if (!_initialized) return null;
+    final result = _getSubtitleFilePath();
+    if (result == nullptr) return null;
+    final text = result.toDartString();
+    _freeString(result);
+    return text;
+  }
+
+  void setMemorySensitivity(double val) {
+    if (_initialized) _setMemorySensitivity(val);
+  }
+
+  double getMemorySensitivity() => _initialized ? _getMemorySensitivity() : 0.5;
 
   static void log(String message) {
     // ignore: avoid_print

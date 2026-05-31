@@ -81,16 +81,17 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
   }
 
   Widget _miniLayout(AppState state) {
+    final invert = state.invertMiniText;
     return Column(
       children: [
-        _header(state, mini: true),
-        Expanded(child: _listBody(state, true)),
-        _manualInput(state, true),
+        _header(state, mini: true, invert: invert),
+        Expanded(child: _listBody(state, true, invert: invert)),
+        _manualInput(state, true, invert: invert),
       ],
     );
   }
 
-  Widget _header(AppState state, {bool mini = false}) {
+  Widget _header(AppState state, {bool mini = false, bool invert = false}) {
     return Container(
       padding: EdgeInsets.symmetric(horizontal: mini ? 10 : 12, vertical: mini ? 4 : 8),
       decoration: BoxDecoration(
@@ -108,7 +109,7 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
             child: Text(
               '消息列表(${state.pendingCount}/${state.sentenceList.length})',
               style: mini
-                  ? AppTextStyles.listHeader.copyWith(fontSize: 11, color: AppColors.textDark)
+                  ? AppTextStyles.listHeader.copyWith(fontSize: 11, color: invert ? AppColors.textDark : Colors.white, fontWeight: FontWeight.w600, shadows: invert ? const [Shadow(color: Color(0x60FFFFFF), blurRadius: 4, offset: Offset(0, 1))] : const [Shadow(color: Color(0x80000000), blurRadius: 4, offset: Offset(0, 1))])
                   : AppTextStyles.listHeader,
               overflow: TextOverflow.ellipsis,
             ),
@@ -135,8 +136,8 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
                     fontSize: 10,
                     color: state.sentenceList.isEmpty
                         ? AppColors.textDim.withValues(alpha: 0.3)
-                        : (mini ? AppColors.text : AppColors.textMuted),
-                    fontWeight: mini ? FontWeight.w500 : FontWeight.normal,
+                        : (mini ? (invert ? AppColors.textDark : Colors.white) : AppColors.textMuted),
+                    fontWeight: mini ? FontWeight.w600 : FontWeight.normal,
                   ),
                 ),
               ),
@@ -147,7 +148,7 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
     );
   }
 
-  Widget _listBody(AppState state, bool mini) {
+  Widget _listBody(AppState state, bool mini, {bool invert = false}) {
     final isEmpty = state.sentenceList.isEmpty && !(state.liveText.isNotEmpty && state.isRecording);
 
     if (isEmpty) {
@@ -164,7 +165,7 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
             Text(
               '暂无消息',
               style: mini
-                  ? AppTextStyles.emptyState.copyWith(color: AppColors.textSecondary)
+                  ? AppTextStyles.emptyState.copyWith(color: invert ? AppColors.textDark : Colors.white, fontWeight: FontWeight.w500, shadows: invert ? const [Shadow(color: Color(0x60FFFFFF), blurRadius: 4, offset: Offset(0, 1))] : const [Shadow(color: Color(0x80000000), blurRadius: 4, offset: Offset(0, 1))])
                   : AppTextStyles.emptyState,
             ),
           ],
@@ -182,14 +183,14 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
         padding: EdgeInsets.all(mini ? 4 : 8),
         children: [
           if (state.liveText.isNotEmpty && state.isRecording)
-            _liveEntry(state.liveText, mini),
-          ...state.sentenceList.map((item) => _listItem(state, item, mini)),
+            _liveEntry(state.liveText, mini, invert: invert),
+          ...state.sentenceList.map((item) => _listItem(state, item, mini, invert: invert)),
         ],
       ),
     );
   }
 
-  Widget _liveEntry(String text, bool mini) {
+  Widget _liveEntry(String text, bool mini, {bool invert = false}) {
     return Container(
       margin: const EdgeInsets.only(bottom: 4),
       padding: EdgeInsets.symmetric(horizontal: mini ? 8 : 10, vertical: mini ? 4 : 6),
@@ -199,13 +200,13 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
       child: Text(
         text,
         style: mini
-            ? AppTextStyles.liveEntry.copyWith(fontSize: 11, color: AppColors.textDark)
+            ? AppTextStyles.liveEntry.copyWith(fontSize: 11, color: invert ? AppColors.textDark : Colors.white, fontWeight: FontWeight.w500, shadows: invert ? const [Shadow(color: Color(0x60FFFFFF), blurRadius: 4, offset: Offset(0, 1))] : const [Shadow(color: Color(0x80000000), blurRadius: 4, offset: Offset(0, 1))])
             : AppTextStyles.liveEntry,
       ),
     );
   }
 
-  Widget _listItem(AppState state, SentenceItem item, bool mini) {
+  Widget _listItem(AppState state, SentenceItem item, bool mini, {bool invert = false}) {
     final isEditing = state.editingId == item.id;
 
     Color borderColor;
@@ -237,7 +238,7 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
     }
 
     if (mini) {
-      bgColor = const Color(0xFFE8F5F2);
+      bgColor = Colors.transparent;
     }
 
     return Opacity(
@@ -286,21 +287,27 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
                   item.text,
                   style: TextStyle(
                     fontSize: mini ? 11 : 12,
-                    color: mini ? AppColors.textDark : AppColors.text,
+                    color: mini ? (invert ? AppColors.textDark : Colors.white) : AppColors.text,
+                    fontWeight: mini ? FontWeight.w600 : null,
                     decoration: item.isSuccess ? TextDecoration.lineThrough : null,
+                    shadows: mini ? (invert ? const [Shadow(color: Color(0x60FFFFFF), blurRadius: 4, offset: Offset(0, 1))] : const [Shadow(color: Color(0x80000000), blurRadius: 4, offset: Offset(0, 1))]) : null,
                   ),
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
             const SizedBox(width: 6),
             if (!item.isSuccess) ...[
-              _actionBtn('发', () => state.sendItem(item.id), AppColors.textDark,
-                  AppColors.primary, item.isSending || !state.isConnected, mini),
+              _actionBtn('发', () => state.sendItem(item.id),
+                  mini ? (invert ? AppColors.textDark : Colors.white) : AppColors.textDark,
+                  mini ? (invert ? AppColors.textDark : Colors.white) : AppColors.primary,
+                  item.isSending || !state.isConnected, mini),
               _actionBtn('编', () => state.startEdit(item.id, item.text),
-                  AppColors.textSecondary, AppColors.primary, false, mini),
+                  mini ? (invert ? AppColors.textDark : Colors.white) : AppColors.textSecondary,
+                  mini ? (invert ? AppColors.textDark : Colors.white) : AppColors.primary, false, mini),
             ],
-            _actionBtn('×', () => state.deleteItem(item.id), AppColors.failed,
-                AppColors.danger, false, mini),
+            _actionBtn('×', () => state.deleteItem(item.id),
+                mini ? (invert ? AppColors.textDark : Colors.white) : AppColors.failed,
+                mini ? (invert ? AppColors.textDark : Colors.white) : AppColors.danger, false, mini),
           ],
         ),
       ),
@@ -356,7 +363,7 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
     );
   }
 
-  Widget _manualInput(AppState state, bool mini) {
+  Widget _manualInput(AppState state, bool mini, {bool invert = false}) {
     final canSend = state.manualInput.trim().isNotEmpty &&
         state.isConnected &&
         state.cookieStatus;
@@ -364,7 +371,7 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
     return Container(
       padding: EdgeInsets.all(mini ? 4 : 8),
       decoration: BoxDecoration(
-        color: mini ? const Color(0xFFE8F5F2) : const Color(0x66FFFFFF),
+        color: mini ? Colors.transparent : const Color(0x66FFFFFF),
         border: Border(
           top: BorderSide(
             color: mini ? const Color(0x265BC0BE) : AppColors.divider,
@@ -383,13 +390,16 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
                   onSubmitted: (_) => state.sendManualMessage(),
                   style: TextStyle(
                     fontSize: mini ? 11 : 12,
-                    color: mini ? AppColors.textDark : AppColors.text,
+                    color: mini ? (invert ? AppColors.textDark : Colors.white) : AppColors.text,
+                    fontWeight: mini ? FontWeight.w600 : null,
+                    shadows: mini ? (invert ? const [Shadow(color: Color(0x60FFFFFF), blurRadius: 4, offset: Offset(0, 1))] : const [Shadow(color: Color(0x80000000), blurRadius: 4, offset: Offset(0, 1))]) : null,
                   ),
                   decoration: InputDecoration(
                     hintText: '输入弹幕...',
                     hintStyle: TextStyle(
-                      color: mini ? AppColors.textMuted : AppColors.textDim,
+                      color: mini ? (invert ? AppColors.textDark.withValues(alpha: 0.6) : Colors.white.withValues(alpha: 0.6)) : AppColors.textDim,
                       fontSize: mini ? 11 : 12,
+                      shadows: mini ? (invert ? [const Shadow(color: Color(0x60FFFFFF), blurRadius: 3, offset: Offset(0, 1))] : [const Shadow(color: Color(0x80000000), blurRadius: 3, offset: Offset(0, 1))]) : null,
                     ),
                     contentPadding: EdgeInsets.symmetric(
                       horizontal: mini ? 8 : 10,
@@ -436,14 +446,14 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(Icons.send_rounded, size: 12, color: canSend ? AppColors.textDark : AppColors.textDark.withValues(alpha: 0.5)),
+              Icon(Icons.send_rounded, size: 12, color: canSend ? Colors.white : Colors.white.withValues(alpha: 0.5)),
               const SizedBox(width: 4),
               Text(
                 '发送',
                 style: TextStyle(
                   fontSize: mini ? 11 : 11,
-                  color: canSend ? AppColors.textDark : AppColors.textDark.withValues(alpha: 0.5),
-                  fontWeight: FontWeight.w500,
+                  color: canSend ? Colors.white : Colors.white.withValues(alpha: 0.5),
+                  fontWeight: FontWeight.w600,
                 ),
               ),
             ],

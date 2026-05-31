@@ -239,12 +239,12 @@ class TopBar extends StatelessWidget {
 
   VoidCallback _closeWindow(AppState state) {
     return () {
-      if (state.closeBehavior == CloseBehavior.exit) {
+      if (state.closeBehavior == CloseBehavior.exit || !state.trayAvailable) {
         NativeBridge.instance.shutdown();
         trayManager.destroy();
         windowManager.destroy();
       } else {
-        windowManager.hide();
+        windowManager.setOpacity(0.0);
       }
     };
   }

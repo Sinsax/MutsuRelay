@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../providers/app_state.dart';
@@ -44,13 +45,42 @@ class SettingsModal extends StatelessWidget {
                       const SizedBox(height: 8),
                       _divider(),
                       const SizedBox(height: 8),
-                      const Text('语音识别', style: AppTextStyles.settingsSection),
+                      Row(
+                        children: [
+                          const Text('语音识别', style: AppTextStyles.settingsSection),
+                          if (state.asrRestarting)
+                            Padding(
+                              padding: const EdgeInsets.only(left: 6),
+                              child: Text(
+                                '(重启中...)',
+                                style: TextStyle(
+                                  fontSize: 10,
+                                  color: AppColors.textMuted,
+                                ),
+                              ),
+                            ),
+                          const Spacer(),
+                          Text(
+                            '有语音问题请重启asr引擎',
+                            style: TextStyle(
+                              fontSize: 10,
+                              color: AppColors.textMuted,
+                            ),
+                          ),
+                        ],
+                      ),
                       const SizedBox(height: 4),
                       _languageRow(state),
                       const SizedBox(height: 4),
                       _noiseRow(context, state),
                       const SizedBox(height: 4),
                       _censorModeRow(state),
+                      const SizedBox(height: 8),
+                      _divider(),
+                      const SizedBox(height: 8),
+                      const Text('文件', style: AppTextStyles.settingsSection),
+                      const SizedBox(height: 4),
+                      _dataDirRow(context),
                       const SizedBox(height: 8),
                       _divider(),
                       const SizedBox(height: 8),
@@ -178,18 +208,35 @@ class SettingsModal extends StatelessWidget {
   Widget _noiseRow(BuildContext context, AppState state) {
     return Row(
       children: [
-        const Text('降噪', style: AppTextStyles.settingsRow),
-        const Spacer(),
-        _toggleGroup<bool>(
-          [('开', true), ('关', false)],
-          state.noiseSuppress,
-          (v) => state.noiseSuppress = v,
+        Expanded(
+          child: Row(
+            children: [
+              const Text('降噪', style: AppTextStyles.settingsRow),
+              const Spacer(),
+              _toggleGroup<bool>(
+                [('开', true), ('关', false)],
+                state.noiseSuppress,
+                (v) => state.noiseSuppress = v,
+              ),
+            ],
+          ),
         ),
-        const SizedBox(width: 6),
-        _actionBtn(
-          state.asrRestarting ? '重启中...' : '重启',
-          () => state.restartAsr(),
-          disabled: state.asrRestarting,
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 4),
+          child: Text('|', style: TextStyle(color: AppColors.textMuted)),
+        ),
+        Expanded(
+          child: Row(
+            children: [
+              const Text('asr引擎', style: AppTextStyles.settingsRow),
+              const Spacer(),
+              _actionBtn(
+                '重启',
+                () => state.restartAsr(),
+                disabled: state.asrRestarting,
+              ),
+            ],
+          ),
         ),
       ],
     );
@@ -274,5 +321,14 @@ class SettingsModal extends StatelessWidget {
         ),
       ),
     );
+  }
+
+  Widget _dataDirRow(BuildContext context) {
+    return _settingsRow('配置文件-字幕文件', _actionBtn('打开文件夹', () {
+      final path = NativeBridge.instance.getConfigDirPath();
+      if (path != null) {
+        Process.run('explorer', [path]);
+      }
+    }));
   }
 }

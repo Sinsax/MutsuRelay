@@ -10,7 +10,7 @@ class AppColors {
   static const textSecondary = Color(0xFF5A9E96);
   static const textMuted = Color(0xFF7AB8AE);
   static const textDim = Color(0xFF9AC8BE);
-  static const textDark = Color(0xFF2D5A50);
+  static const textDark = Color(0xFF0A2A26);
 
   static const micActive = Color(0xFFFF6B6B);
   static const micActiveLight = Color(0xFFFF8A8A);
