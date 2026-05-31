@@ -42,7 +42,7 @@ fvm flutter clean                      # fix stale C++ build cache after Dart-on
 - `libmutsurelay_native.so` has **no RPATH** (confirmed by `readelf`).
 - `native_bridge.dart:load()` pre-loads `libsherpa-onnx-c-api.so`, `libsherpa-onnx-cxx-api.so`, `libonnxruntime.so` via `DynamicLibrary.open` **before** opening the main lib. This is **essential in dev mode** (`flutter run`) where `LD_LIBRARY_PATH` is not set.
 - In AppImage, `AppRun` sets `LD_LIBRARY_PATH="$HERE/lib"` — pre-loading is redundant but harmless.
-- Bundle layout (AppImage): `lib/libmutsurelay_native.so`, `lib/libonnxruntime.so`, `lib/libsherpa-onnx-c-api.so`, `lib/libsherpa-onnx-cxx-api.so`, `lib/asr/model/model.int8.onnx`, `lib/asr/model/tokens.txt`.
+- Bundle layout (AppImage): `lib/libmutsurelay_native.so`, `lib/libonnxruntime.so`, `lib/libsherpa-onnx-c-api.so`, `lib/libsherpa-onnx-cxx-api.so`, `asr/model/model.int8.onnx`, `asr/model/tokens.txt`.
 
 ### Linux: cpal audio device selection
 - `native/src/lib.rs:154-167` prefers mic-named devices, then `"pulse"/"default"/"sysdefault:"` (PipeWire PulseAudio compat), then first available. On PipeWire systems, the virtual `"pipewire"` device often doesn't deliver audio frames to cpal's ALSA backend — the fix selects `"pulse"` or `"sysdefault:"` devices first.
@@ -62,7 +62,7 @@ fvm flutter clean                      # fix stale C++ build cache after Dart-on
 - Debug build copies also go to `build/windows/x64/runner/Debug/` so `flutter run -d windows` finds everything.
 
 ### Windows: tray & close
-- Tray icon requires `.ico` format (`LoadImage(IMAGE_ICON)`). Built at runtime from `assets/logo_tr.png` via in-memory ICO encoder in `main.dart`.
+- Tray icon requires `.ico` format (`LoadImage(IMAGE_ICON)`). Built at runtime from `assets/logo.png` via in-memory ICO encoder in `main.dart`.
 - Close in hide mode: Windows uses `windowManager.hide()` (works normally). Linux uses `setOpacity(0.0)` because `hide()` destroys the tray indicator.
 
 ## Rust gotchas
