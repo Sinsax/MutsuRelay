@@ -1,8 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:provider/provider.dart';
-import 'package:mutsurelay_flutter/providers/app_state.dart';
-import 'package:mutsurelay_flutter/screens/main_screen.dart';
+import 'package:mutsurelay/providers/app_state.dart';
+import 'package:mutsurelay/screens/main_screen.dart';
 
 void main() {
   testWidgets('Main screen renders mic button', (WidgetTester tester) async {

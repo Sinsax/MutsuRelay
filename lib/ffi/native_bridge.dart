@@ -159,6 +159,16 @@ class NativeBridge {
     }
 
     try {
+      // Pre-load runtime dependencies so dlopen can resolve them
+      final libDir = File(path).parent.path;
+      for (final dep in Platform.isLinux
+          ? ['libsherpa-onnx-c-api.so', 'libsherpa-onnx-cxx-api.so', 'libonnxruntime.so']
+          : <String>[]) {
+        final depPath = '$libDir/$dep';
+        if (File(depPath).existsSync()) {
+          DynamicLibrary.open(depPath);
+        }
+      }
       _lib = DynamicLibrary.open(path);
       _bindFunctions();
       _initialized = true;
@@ -186,7 +196,11 @@ class NativeBridge {
         'linux/libmutsurelay_native.so',
         'linux/mutsurelay_native/libmutsurelay_native.so',
         'native/target/release/libmutsurelay_native.so',
+        'native/target/debug/libmutsurelay_native.so',
       ]);
+      for (final type in ['debug', 'profile', 'release']) {
+        candidates.add('build/linux/x64/$type/bundle/lib/libmutsurelay_native.so');
+      }
     } else if (Platform.isMacOS) {
       candidates.addAll([
         'libmutsurelay_native.dylib',

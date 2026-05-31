@@ -151,12 +151,18 @@ fn run_recording_pipeline() -> Option<()> {
         println!("[rust]   device: {:?}", d.name());
     }
 
-    // Prefer microphone devices, skip virtual cables / loopback
+    // Prefer microphone devices, then PulseAudio/PipeWire compat, then hardware ALSA
     let device = devices.iter().find(|d| {
         d.name().map(|n| {
             let nl = n.to_lowercase();
             nl.contains("microphone") || nl.contains("mic") || nl.contains("话筒")
         }).unwrap_or(false)
+    }).or_else(|| {
+        // "pulse" or "default" works reliably on PipeWire via pulse-to-alsa compat
+        devices.iter().find(|d| d.name().map(|n| {
+            let nl = n.to_lowercase();
+            nl == "pulse" || nl == "default" || nl.starts_with("sysdefault")
+        }).unwrap_or(false))
     }).or_else(|| devices.iter().next())?.clone();
     println!("[rust] selected device: {:?}", device.name());
 

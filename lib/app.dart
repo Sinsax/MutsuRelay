@@ -52,7 +52,7 @@ class _MutsuRelayHomeState extends State<MutsuRelayHome> with WindowListener {
   @override
   void onWindowClose() async {
     final state = context.read<AppState>();
-    if (state.closeBehavior == CloseBehavior.hide && state.trayAvailable) {
+    if (state.closeBehavior == CloseBehavior.hide) {
       await windowManager.setOpacity(0.0);
     } else {
       NativeBridge.instance.shutdown();

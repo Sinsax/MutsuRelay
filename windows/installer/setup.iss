@@ -13,7 +13,7 @@ AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 DefaultDirName={userpf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
-UninstallDisplayIcon={app}\mutsurelay_flutter.exe
+UninstallDisplayIcon={app}\mutsurelay.exe
 Compression=lzma2
 SolidCompression=yes
 OutputDir=..\..\dist
@@ -32,8 +32,8 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 Source: "{#MyBuildDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\{#MyAppName}"; Filename: "{app}\mutsurelay_flutter.exe"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\mutsurelay_flutter.exe"; Tasks: desktopicon
+Name: "{group}\{#MyAppName}"; Filename: "{app}\mutsurelay.exe"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\mutsurelay.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\mutsurelay_flutter.exe"; Description: "Launch MutsuRelay"; Flags: postinstall nowait skipifsilent shellexec
+Filename: "{app}\mutsurelay.exe"; Description: "Launch MutsuRelay"; Flags: postinstall nowait skipifsilent shellexec

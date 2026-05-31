@@ -56,6 +56,15 @@ Uint8List _buildIcoFromBgra(Uint8List bgra, int w, int h) {
 }
 
 Future<String> _generateTrayIconPath() async {
+  // Linux: appindicator expects PNG, not ICO
+  if (Platform.isLinux) {
+    final data = await rootBundle.load('assets/logo_tr.png');
+    final pngFile = File('${Directory.systemTemp.path}/mutsurelay_tray.png');
+    await pngFile.writeAsBytes(data.buffer.asUint8List());
+    return pngFile.path;
+  }
+
+  // Windows: LoadImage(IMAGE_ICON) requires .ico
   Uint8List icoBytes;
   try {
     final data = await rootBundle.load('assets/logo_tr.png');
@@ -118,7 +127,10 @@ class _TrayHandler with TrayListener {
 
   @override
   void onTrayIconRightMouseDown() async {
-    await trayManager.popUpContextMenu();
+    // Linux: appindicator auto-shows menu, popUpContextMenu not implemented
+    if (!Platform.isLinux) {
+      await trayManager.popUpContextMenu();
+    }
   }
 }
 
@@ -127,7 +139,10 @@ Future<void> _initTray(AppState appState, String iconPath) async {
   trayManager.addListener(handler);
 
   await trayManager.setIcon(iconPath);
-  await trayManager.setToolTip('MutsuRelay');
+  // Linux: setToolTip not implemented in tray_manager plugin
+  if (!Platform.isLinux) {
+    await trayManager.setToolTip('MutsuRelay');
+  }
   // Small delay to let the tray icon register before setting context menu
   await Future.delayed(const Duration(milliseconds: 50));
 
