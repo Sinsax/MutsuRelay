@@ -62,7 +62,7 @@ fvm flutter clean                      # fix stale C++ build cache after Dart-on
 - Debug build copies also go to `build/windows/x64/runner/Debug/` so `flutter run -d windows` finds everything.
 
 ### Windows: tray & close
-- Tray icon requires `.ico` format (`LoadImage(IMAGE_ICON)`). Built at runtime from `assets/logo_tr.png` via in-memory ICO encoder in `main.dart`.
+- Tray icon requires `.ico` format (`LoadImage(IMAGE_ICON)`). Built at runtime from `assets/logo.png` via in-memory ICO encoder in `main.dart`.
 - Close in hide mode: Windows uses `windowManager.hide()` (works normally). Linux uses `setOpacity(0.0)` because `hide()` destroys the tray indicator.
 
 ## Rust gotchas

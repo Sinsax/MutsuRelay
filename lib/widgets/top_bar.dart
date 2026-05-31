@@ -128,7 +128,7 @@ class TopBar extends StatelessWidget {
       mainAxisSize: MainAxisSize.min,
       children: [
         Image.asset(
-          'assets/logo_tr.png',
+          'assets/logo.png',
           width: 20,
           height: 20,
           filterQuality: FilterQuality.high,
