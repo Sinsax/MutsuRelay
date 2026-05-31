@@ -125,7 +125,7 @@ iscc windows\installer\setup.iss
 Compress-Archive -Path "build\windows\x64\runner\Release\*" -DestinationPath "dist\MutsuRelay.zip"
 
 # Linux AppImage
-dart run fastforge package --platform linux --targets appimage
+dart run fastforge:main package --platform linux --targets appimage
 ```
 
 CI 会在每次推送时自动执行完整构建+打包流程，产物可在 Action 页面下载。
