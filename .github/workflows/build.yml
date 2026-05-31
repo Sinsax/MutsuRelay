@@ -130,7 +130,7 @@ jobs:
         run: flutter build linux --release
 
       - name: Create AppImage
-        run: dart run fastforge package --platform linux --targets appimage
+        run: dart run fastforge:main package --platform linux --targets appimage
         env:
           APPIMAGE_EXTRACT_AND_RUN: 1
 
