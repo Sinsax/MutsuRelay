@@ -133,6 +133,7 @@ jobs:
         run: dart run fastforge:main package --platform linux --targets appimage
         env:
           APPIMAGE_EXTRACT_AND_RUN: 1
+          LD_LIBRARY_PATH: build/linux/x64/release/bundle/lib
 
       - uses: actions/upload-artifact@v4
         with:
