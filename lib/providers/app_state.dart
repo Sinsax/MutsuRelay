@@ -219,11 +219,24 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  bool _invertMiniText = false;
+  bool get invertMiniText => _invertMiniText;
+  set invertMiniText(bool value) {
+    _invertMiniText = value;
+    notifyListeners();
+  }
+  void toggleInvertMiniText() {
+    _invertMiniText = !_invertMiniText;
+    notifyListeners();
+  }
+
   // Settings visibility
   bool _showSettings = false;
   bool get showSettings => _showSettings;
   set showSettings(bool value) {
+    if (_showSettings == value) return;
     _showSettings = value;
+    if (!value) restartAsr();
     notifyListeners();
   }
 
@@ -235,6 +248,13 @@ class AppState extends ChangeNotifier {
   }
 
   // Settings values
+  bool _trayAvailable = true;
+  bool get trayAvailable => _trayAvailable;
+  set trayAvailable(bool value) {
+    _trayAvailable = value;
+    notifyListeners();
+  }
+
   CloseBehavior _closeBehavior = CloseBehavior.hide;
   CloseBehavior get closeBehavior => _closeBehavior;
   set closeBehavior(CloseBehavior value) {
@@ -243,7 +263,7 @@ class AppState extends ChangeNotifier {
     saveSettings();
   }
 
-  CensorMode _censorMode = CensorMode.off;
+  CensorMode _censorMode = CensorMode.pinyin;
   CensorMode get censorMode => _censorMode;
   set censorMode(CensorMode value) {
     _censorMode = value;
@@ -252,7 +272,7 @@ class AppState extends ChangeNotifier {
     saveSettings();
   }
 
-  String _asrLang = 'auto';
+  String _asrLang = 'zh';
   String get asrLang => _asrLang;
   set asrLang(String value) {
     _asrLang = value;
@@ -274,6 +294,24 @@ class AppState extends ChangeNotifier {
   set asrRestarting(bool value) {
     _asrRestarting = value;
     notifyListeners();
+  }
+
+  String _subtitleFilePath = '';
+  String get subtitleFilePath => _subtitleFilePath;
+  set subtitleFilePath(String value) {
+    _subtitleFilePath = value;
+    NativeBridge.instance.setSubtitleFilePath(value);
+    notifyListeners();
+    saveSettings();
+  }
+
+  double _memorySensitivity = 0.5;
+  double get memorySensitivity => _memorySensitivity;
+  set memorySensitivity(double value) {
+    _memorySensitivity = value.clamp(0.0, 1.0);
+    NativeBridge.instance.setMemorySensitivity(_memorySensitivity);
+    notifyListeners();
+    saveSettings();
   }
 
   // QR code
@@ -491,7 +529,6 @@ class AppState extends ChangeNotifier {
     if (_asrRestarting) return;
     _asrRestarting = true;
     notifyListeners();
-    showToast('正在重启 ASR...', ToastType.info);
     final bridge = NativeBridge.instance;
     Future(() {
       bridge.initAsr(_modelDir());
@@ -507,10 +544,15 @@ class AppState extends ChangeNotifier {
       return 'asr/model';
     }
     final exeDir = File(Platform.resolvedExecutable).parent;
-    for (final dir in ['asr/model', '../asr/model', '../../asr/model']) {
-      final p = '${exeDir.path}\\$dir';
+    final candidates = <String>[];
+    if (Platform.isLinux) {
+      candidates.add('lib/asr/model');
+    }
+    candidates.addAll(['asr/model', '../asr/model', '../../asr/model']);
+    for (final dir in candidates) {
+      final p = '${exeDir.path}/$dir';
       if (Directory(p).existsSync() &&
-          File('$p\\model.int8.onnx').existsSync()) {
+          File('$p/model.int8.onnx').existsSync()) {
         return p;
       }
     }
@@ -606,6 +648,8 @@ class AppState extends ChangeNotifier {
     bridge.setRoomId(int.tryParse(_roomId) ?? 0);
     bridge.setAsrLang(_asrLang);
     bridge.setCloseBehavior(_closeBehavior.name);
+    bridge.setSubtitleFilePath(_subtitleFilePath);
+    bridge.setMemorySensitivity(_memorySensitivity);
     bridge.saveConfig();
   }
 
@@ -632,6 +676,14 @@ class AppState extends ChangeNotifier {
       if (cb != null && cb.isNotEmpty) {
         _closeBehavior = cb == 'exit' ? CloseBehavior.exit : CloseBehavior.hide;
       }
+
+      final configDir = bridge.getConfigDirPath();
+      if (configDir != null) {
+        _subtitleFilePath = '$configDir/capture.txt';
+        bridge.setSubtitleFilePath(_subtitleFilePath);
+      }
+
+      _memorySensitivity = bridge.getMemorySensitivity();
 
       _cookieStatus = bridge.getCookieStatus();
       _isConnected = bridge.isConnected();

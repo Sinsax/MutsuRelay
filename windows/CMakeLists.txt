@@ -23,11 +23,16 @@ else()
       "Debug" "Profile" "Release")
   endif()
 endif()
+
 # Define settings for the Profile build mode.
 set(CMAKE_EXE_LINKER_FLAGS_PROFILE "${CMAKE_EXE_LINKER_FLAGS_RELEASE}")
 set(CMAKE_SHARED_LINKER_FLAGS_PROFILE "${CMAKE_SHARED_LINKER_FLAGS_RELEASE}")
 set(CMAKE_C_FLAGS_PROFILE "${CMAKE_C_FLAGS_RELEASE}")
 set(CMAKE_CXX_FLAGS_PROFILE "${CMAKE_CXX_FLAGS_RELEASE}")
+
+# Project root for shared CMake modules
+set(PROJECT_ROOT "${CMAKE_SOURCE_DIR}/..")
+include("${PROJECT_ROOT}/cmake/native_bundle.cmake")
 
 # Use Unicode for all projects.
 add_definitions(-DUNICODE -D_UNICODE)
@@ -87,20 +92,24 @@ if(PLUGIN_BUNDLED_LIBRARIES)
     COMPONENT Runtime)
 endif()
 
-# Native library (mutsurelay_native.dll)
-if(CMAKE_BUILD_TYPE MATCHES "Debug")
-  set(NATIVE_LIB_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../native/target/debug")
-else()
-  set(NATIVE_LIB_PATH "${CMAKE_CURRENT_SOURCE_DIR}/../native/target/release")
-endif()
-install(FILES "${NATIVE_LIB_PATH}/mutsurelay_native.dll"
-        DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
-        OPTIONAL
-        COMPONENT Runtime)
-install(FILES "${NATIVE_LIB_PATH}/mutsurelay_native.pdb"
-        DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
-        OPTIONAL
-        COMPONENT Runtime)
+# Rust native library + ASR model (cross-platform shared logic)
+setup_native_and_model(
+  TARGET       ${BINARY_NAME}
+  PROJECT_ROOT "${PROJECT_ROOT}"
+  MODEL_DEST   "${INSTALL_BUNDLE_LIB_DIR}/asr/model"
+  LIB_DEST     "${INSTALL_BUNDLE_LIB_DIR}"
+  LIB_NAME     "mutsurelay_native.dll"
+  RUNTIME_DEPS
+    "sherpa-onnx-c-api.dll"
+    "sherpa-onnx-cxx-api.dll"
+    "onnxruntime.dll"
+    "onnxruntime_providers_shared.dll"
+)
+
+# Install blocklist.txt alongside ASR model
+install(FILES "${PROJECT_ROOT}/asr/blocklist.txt"
+        DESTINATION "${INSTALL_BUNDLE_LIB_DIR}/asr"
+        OPTIONAL COMPONENT Runtime)
 
 # Copy the native assets provided by the build.dart from all packages.
 set(NATIVE_ASSETS_DIR "${PROJECT_BUILD_DIR}native_assets/windows/")

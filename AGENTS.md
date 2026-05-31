@@ -4,78 +4,70 @@
 
 ```powershell
 flutter analyze                          # gate before commit
-flutter run -d windows                   # run desktop app
-cargo build                              # build Rust lib (native/)
-flutter clean                            # fix C++ build errors after Dart-only changes
-
-# Full build flow
-cd native; .\download-model.ps1          # one-time (~200MB SenseVoice)
-cd native; .\build.ps1                   # release (default); -Profile debug for debug
-cd ..; flutter run -d windows
+flutter run -d windows                   # CMake auto-builds Rust if DLL missing
+flutter build windows --release          # one-command: download model + cargo build + bundle
+dart run tool/build_and_run.dart         # build Rust + flutter run (cross-platform, skip cmake)
+native\build.ps1; flutter run -d windows # even faster: copy DLL only, no cmake
+flutter clean                            # fix stale C++ build cache after Dart-only changes
 ```
 
 ## Architecture
 
-```
-lib/main.dart                 # Entry: init window, gen ICO, init tray (post-frame), runApp
-lib/app.dart                  # MutsuRelayApp + MutsuRelayHome (mode switch, overlays)
-lib/providers/app_state.dart  # Central ChangeNotifier — recording, connection, settings, toast
-lib/ffi/native_bridge.dart    # Dart FFI bindings → mutsurelay_native.dll (30+ C fns)
-lib/screens/main_screen.dart  # Normal mode layout (left panel + message list + right panel)
-lib/screens/mini_screen.dart  # Mini mode overlay (transparent bg via miniOpacity)
-lib/widgets/                  # All UI components (top_bar, settings_modal, mic_button, etc.)
-lib/theme/app_theme.dart      # Colors, text styles, layout constants (AppInsets)
-native/src/lib.rs             # Rust cdylib: recording pipeline, cpal+VAD+ASR, C API
-native/src/bilive.rs          # Bilibili QR login, cookie, room connect, send message
-native/src/vad.rs             # VAD: RMS, resample, NoiseEstimator, is_speech_active
-native/src/censor.rs           # Keyword censor (asterisk/pinyin)
-```
-
-- State: `provider` + `ChangeNotifier`, via `Consumer<AppState>` or `context.watch<AppState>()`.
-- Window: `TitleBarStyle.hidden` via `window_manager`. Tray via `tray_manager`.
-- Native lib degrades to mock mode when DLL absent (auto-detected in `NativeBridge.load()`).
-
-## Key Layout
-
-| Constant | Value | Notes |
+| Layer | Key files | Notes |
 |---|---|---|
-| `AppInsets.normalW` | 608 | Normal mode window width |
-| `AppInsets.normalH` | 320 | Normal mode window height |
-| `AppInsets.miniW` / `miniH` | 280 / 360 | Mini mode (actual size set in `setWindowMode`: 280×380) |
-| `AppInsets.leftPanelW` | 120 | Left panel (mic + VAD) |
-| `AppInsets.rightPanelW` | 140 | Right panel (send mode, room ID, clear) |
-| `AppInsets.miniToolbarH` | 30 | Mini toolbar height |
-| Settings modal width | 250 | Must stay <280 to fit mini mode with border |
+| Entry | `lib/main.dart` | Sets window size, ICO encoder, tray init post-frame |
+| State | `lib/providers/app_state.dart` | Single `ChangeNotifier` via provider |
+| FFI | `lib/ffi/native_bridge.dart` | 30+ C functions, auto-degrades to mock when DLL absent |
+| UI | `lib/widgets/settings_modal.dart` | 250px width `Stack` overlay (not a dialog) |
+| Rust cdylib | `native/src/lib.rs` | Recording pipeline, C API, config persistence |
+| Bilibili | `native/src/bilive.rs` | QR login, cookie, room, subtitle write |
+| VAD/ASR | `native/src/lib.rs` + `vad.rs` | cpal + sherpa-onnx SenseVoice |
 
-## Known Gotchas
+- Rust lib: `native/Cargo.toml`, features `default = ["asr", "async"]`. `crate-type = ["cdylib", "staticlib"]`.
+- `mutsurelay_native.dll` runtime deps: `sherpa-onnx-c-api.dll`, `sherpa-onnx-cxx-api.dll`, `onnxruntime.dll`, `onnxruntime_providers_shared.dll`.
+- Native lib autodetected via `_defaultLibraryPath()`; silently drops to mock if not found.
 
-### Tray
-- Windows `LoadImage(IMAGE_ICON)` requires `.ico`, not `.png`. ICO encoder in `main.dart` decodes `assets/logo_tr.png` → BGRA → BITMAPINFOHEADER + AND mask.
-- Tray init order: `setIcon()` first (`NIM_ADD`), then `setToolTip()`/`setContextMenu()` (`NIM_MODIFY`). All tray calls deferred to `addPostFrameCallback` (after `runApp`).
-- Right-click menu: must call `trayManager.popUpContextMenu()` explicitly (tray_manager 0.5.2).
+## Rust gotchas
 
-### Rust Native
-- `println!` from Rust background threads is captured by `flutter run` console; `log::info!` may be less reliable on Windows.
-- `clear_last_error()` must be called BEFORE `refresh_user_info()` in `set_cookie()` (`bilive.rs:302`), not after, or errors are lost.
-- `RECOGNITION_TEXT` uses `std::mem::take` each poll — each Rust-side recognition string is consumed exactly once per Dart poll cycle.
-- Recording pipeline wrapped in `catch_unwind` (`mutsurelay_start_recording`) — Rust panics are caught but `Option`/`Result` errors via `?` are not, and silently set `IS_RECORDING` false.
-- `env_logger` initialized once in `mutsurelay_init()` with `INITIALIZED` guard.
-- Cargo features: `default = ["asr", "async"]`. `asr` enables `sherpa-onnx` (heavy, `features = ["shared"]`), `async` enables `tokio`.
-- Runtime DLL deps for `mutsurelay_native.dll`: `sherpa-onnx-c-api.dll`, `sherpa-onnx-cxx-api.dll`, `onnxruntime.dll`, `onnxruntime_providers_shared.dll`. `build.ps1` copies them automatically.
-- ASR model: `download-model.ps1` → `asr/model/`. Loaded from working dir (dev) or exe-relative paths (release).
+### Language — two statics, must sync
+`lib.rs:ASR_LANG` (used by ASR recognizer) and `bilive.rs:LANGUAGE` (config persistence) are separate. `mutsurelay_set_asr_lang` must write to **both** (`lib.rs:627-628`). `mutsurelay_get_asr_lang` reads from `ASR_LANG`. On config load (`_init_internal`, `mutsurelay_load_config`), sync `bilive::get_language()` → `asr_lang()`.
 
-### Flutter / Dart
-- `fontFamily` must be single name — `'Segoe UI'` only, no CSS-style stacks.
-- `SingleChildScrollView` + `Column` => RenderFlex overflow. Use `ListBody` inside scroll views.
+### Language/censor changes need ASR restart
+Recognizer is created once per `run_recording_pipeline()`. Changing language or model only takes effect after `restartAsr()` (calls `initAsr`).
+
+### Censor
+- `blocklist.txt` must be bundled at `<exe>/asr/blocklist.txt`. `build.ps1` + `windows/CMakeLists.txt` handle this.
+- Mode 1 → `[***]`, Mode 2 → pinyin initials via `pinyin` crate ("傻逼" → "sb").
+- Character-by-character matching (not `str::replace`), words sorted by length descending.
+
+### VAD
+- `max_consecutive_speech` (not cumulative `speech_frames`) guards final recognition.
+- VAD_MIN_SPEECH_FRAMES = 3 consecutive active frames required for final push.
+- Noise floor: `0.999` during speech, `0.95` during silence.
+- Denoising gain matches Tauri: 3 regimes based on signal/noise ratio.
+
+### Config persistence
+- `saveSettings()` in Dart batches all setters then calls `bridge.saveConfig()`.
+- `saveConfig()` (`lib.rs:684`) reads from Rust static globals, writes `config.toml`.
+- `loadConfig()` (`lib.rs:701`) reads `config.toml`, restores statics.
+- Note: `asrLang` setter does NOT call `NativeBridge.setAsrLang` directly — relies on `saveSettings()` doing it. Different from `censorMode`/`noiseSuppress` which call native immediately + save.
+- `loadSettings()` must call `bridge.setSubtitleFilePath()` or Rust `SUBTITLE_FILE_PATH` stays empty and `capture.txt` is never written.
+
+### Other
+- `RECOGNITION_TEXT` uses `std::mem::take` — consumed once per Dart poll.
+- Recording pipeline wraps in `catch_unwind`. `Option`/`Result` errors via `?` are NOT caught and silently set `IS_RECORDING` false.
+- `clear_last_error()` must be called BEFORE `refresh_user_info()` in `set_cookie()`, or errors are lost.
+- `println!` from Rust threads captured by `flutter run` console (`log::info!` less reliable on Windows).
+
+## Flutter gotchas
+
+- Settings modal: `Stack` overlay via `_showSettings` bool. `showSettings = false` auto-calls `restartAsr()`.
+- Mini mode: direct `isMini ? MiniScreen : MainScreen` (not `AnimatedSwitcher`) to avoid Windows accessibility bridge crash.
+- Tray: `setIcon()` first (NIM_ADD), then `setToolTip()`/`setContextMenu()` (NIM_MODIFY). All post-frame callback.
+- `LoadImage(IMAGE_ICON)` requires `.ico` — ICO encoder in `main.dart` from `assets/logo_tr.png`.
+- Accessibility bridge `[ERROR:...accessibility_bridge.cc(114)]` on Windows is a Flutter issue, harmless.
+- `flutter clean` when C++ build errors appear after Dart-only changes (stale cache).
 - `height: double.infinity` inside `Expanded` sets `maxWidth: infinity`, breaking parent.
-- Settings modal width = 250 (narrow enough for 280px mini mode). Modal is a `Stack` overlay via `showSettings` bool — not a dialog.
-- Level bar (`mic_button.dart`) is always rendered (100×4px SizedBox) to prevent layout jump — noise gate indicator visible even when idle.
-- Noise gate indicator position: `((noiseGateDisplay - 1) / 49.0 * 94)` maps slider range 1–50 linearly to 0–94px bar width.
-- Mini mode opacity: `miniOpacity` controls `windowManager.setOpacity()` for desktop see-through. Settings modal disables it temporarily (`setOpacity(1.0)`) when opened in mini mode, restores on close. MiniScreen bg is solid; window opacity handles the transparency effect. TopBar uses `Color(0x805BC0BE)`.
-- Mini mode uses direct `isMini ? MiniScreen : MainScreen` (not `AnimatedSwitcher`) to avoid Windows accessibility bridge crash.
-- First-frame layout depends on window size being set before `runApp`. `main.dart` calls `setMinimumSize` + `setSize` in `waitUntilReadyToShow`.
-- Accessibility bridge `[ERROR:...accessibility_bridge.cc(114)]` on Windows is a Flutter engine issue, harmless.
-- `flutter clean` required when C++ build errors appear after Dart-only changes (stale build cache).
 
-### Bilibili
+## Bilibili
 - `connectRoom()` may resolve a different internal room ID — always call `getRoomId()` afterward and update Dart's `_roomId`.

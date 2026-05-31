@@ -67,3 +67,6 @@ app.*.map.json
 
 # Runtime logs
 error.txt
+
+# Build artifacts
+/dist/

@@ -14,6 +14,8 @@ static LANGUAGE: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new("auto".to
 static CLOSE_BEHAVIOR: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new("hide".to_string()));
 static USER_INFO: LazyLock<Mutex<Option<UserInfo>>> = LazyLock::new(|| Mutex::new(None));
 static LAST_ERROR: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
+static SUBTITLE_FILE_PATH: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
+static MEMORY_SENSITIVITY: LazyLock<Mutex<f32>> = LazyLock::new(|| Mutex::new(0.5));
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UserInfo {
@@ -53,6 +55,10 @@ pub struct Config {
     pub language: String,
     #[serde(default = "default_close_behavior")]
     pub close_behavior: String,
+    #[serde(default)]
+    pub subtitle_file_path: String,
+    #[serde(default = "default_memory_sensitivity")]
+    pub memory_sensitivity: f32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -64,11 +70,12 @@ struct Account {
     buvid3: String,
 }
 
-fn default_noise_gate() -> f32 { 0.01 }
-fn default_censor_mode() -> i32 { 0 }
+fn default_noise_gate() -> f32 { 0.02 }
+fn default_censor_mode() -> i32 { 2 }
 fn default_noise_suppress() -> bool { true }
-fn default_language() -> String { "auto".to_string() }
+fn default_language() -> String { "zh".to_string() }
 fn default_close_behavior() -> String { "hide".to_string() }
+fn default_memory_sensitivity() -> f32 { 0.5 }
 
 fn runtime() -> Result<tokio::runtime::Runtime, String> {
     tokio::runtime::Runtime::new().map_err(|e| format!("创建异步运行时失败: {e}"))
@@ -201,6 +208,8 @@ pub fn init_from_config(config: &Config) {
     }
     set_language(&config.language);
     set_close_behavior(&config.close_behavior);
+    set_subtitle_file_path(&config.subtitle_file_path);
+    set_memory_sensitivity(config.memory_sensitivity);
 }
 
 pub fn generate_qrcode() -> String {
@@ -592,4 +601,47 @@ pub fn send_message(text: &str) -> i32 {
 
 fn current_cookie() -> String {
     COOKIE_TEXT.lock().map(|c| c.clone()).unwrap_or_default()
+}
+
+pub fn write_subtitle_text(text: &str) {
+    let path = SUBTITLE_FILE_PATH.lock().map(|s| s.clone()).unwrap_or_default();
+    if path.is_empty() { return; }
+
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            let mut lines: Vec<&str> = content.lines().collect();
+            lines.push(text);
+            if lines.len() > 20 {
+                lines.drain(..lines.len() - 20);
+            }
+            if let Err(e) = std::fs::write(&path, lines.join("\n")) {
+                println!("[rust] failed to write subtitle: {e}");
+            }
+        }
+        Err(_) => {
+            if let Err(e) = std::fs::write(&path, text) {
+                println!("[rust] failed to write subtitle: {e}");
+            }
+        }
+    }
+}
+
+pub fn set_subtitle_file_path(path: &str) {
+    if let Ok(mut s) = SUBTITLE_FILE_PATH.lock() {
+        *s = path.to_string();
+    }
+}
+
+pub fn get_subtitle_file_path() -> String {
+    SUBTITLE_FILE_PATH.lock().map(|s| s.clone()).unwrap_or_default()
+}
+
+pub fn set_memory_sensitivity(val: f32) {
+    if let Ok(mut s) = MEMORY_SENSITIVITY.lock() {
+        *s = val.clamp(0.0, 1.0);
+    }
+}
+
+pub fn get_memory_sensitivity() -> f32 {
+    MEMORY_SENSITIVITY.lock().map(|s| *s).unwrap_or(0.5)
 }

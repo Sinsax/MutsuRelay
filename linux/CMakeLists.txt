@@ -34,6 +34,10 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     "Debug" "Profile" "Release")
 endif()
 
+# Project root for shared CMake modules
+set(PROJECT_ROOT "${CMAKE_SOURCE_DIR}/..")
+include("${PROJECT_ROOT}/cmake/native_bundle.cmake")
+
 # Compilation settings that should be applied to most targets.
 #
 # Be cautious about adding new options here, as plugins use this function by
@@ -126,3 +130,17 @@ if(NOT CMAKE_BUILD_TYPE MATCHES "Debug")
   install(FILES "${AOT_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
     COMPONENT Runtime)
 endif()
+
+# Rust native library + ASR model (cross-platform shared logic)
+setup_native_and_model(
+  TARGET       ${BINARY_NAME}
+  PROJECT_ROOT "${PROJECT_ROOT}"
+  MODEL_DEST   "${INSTALL_BUNDLE_LIB_DIR}/asr/model"
+  LIB_DEST     "${INSTALL_BUNDLE_LIB_DIR}"
+  LIB_NAME     "libmutsurelay_native.so"
+  RUNTIME_DEPS
+    "libsherpa-onnx-c-api.so"
+    "libsherpa-onnx-cxx-api.so"
+    "libonnxruntime.so"
+    "libonnxruntime_providers_shared.so"
+)

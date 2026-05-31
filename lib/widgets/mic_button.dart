@@ -152,7 +152,7 @@ class _MicButtonState extends State<MicButton>
             ),
           ),
           Positioned(
-            left: (state.noiseGate * 6.0).clamp(0.0, 1.0) * 94.0,
+            left: (state.noiseGate * 2.0).clamp(0.0, 1.0) * 94.0,
             top: -1,
             child: Container(
               width: 2,

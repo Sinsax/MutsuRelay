@@ -25,6 +25,7 @@ class MiniToolbar extends StatelessWidget {
               const SizedBox(width: 8),
               _miniModeToggle(state),
               _miniSettingsBtn(context),
+              _miniInvertBtn(state),
               const SizedBox(width: 4),
               Expanded(child: _opacitySlider(state)),
             ],
@@ -60,7 +61,7 @@ class MiniToolbar extends StatelessWidget {
           child: Icon(
             Icons.mic_rounded,
             size: 14,
-            color: state.isRecording ? Colors.white : AppColors.textDark,
+            color: state.isRecording ? Colors.white : Colors.white,
           ),
         ),
       ),
@@ -83,7 +84,37 @@ class MiniToolbar extends StatelessWidget {
             child: const Icon(
               Icons.settings_rounded,
               size: 13,
-              color: AppColors.textSecondary,
+              color: Colors.white,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _miniInvertBtn(AppState state) {
+    return Padding(
+      padding: const EdgeInsets.only(left: 4),
+      child: GestureDetector(
+        onTap: () => state.toggleInvertMiniText(),
+        child: Container(
+          width: 20,
+          height: 20,
+          decoration: BoxDecoration(
+            color: state.invertMiniText ? Colors.white.withValues(alpha: 0.3) : Colors.transparent,
+            borderRadius: BorderRadius.circular(3),
+            border: Border.all(
+              color: Colors.white.withValues(alpha: 0.5),
+              width: 1,
+            ),
+          ),
+          alignment: Alignment.center,
+          child: Text(
+            state.invertMiniText ? 'A' : 'A',
+            style: TextStyle(
+              fontSize: 11,
+              color: state.invertMiniText ? AppColors.textDark : Colors.white,
+              fontWeight: FontWeight.bold,
             ),
           ),
         ),
@@ -130,8 +161,8 @@ class MiniToolbar extends StatelessWidget {
             label,
             style: TextStyle(
               fontSize: 11,
-              color: active ? AppColors.textDark : AppColors.text,
-              fontWeight: active ? FontWeight.w600 : FontWeight.normal,
+              color: active ? Colors.white : Colors.white.withValues(alpha: 0.8),
+              fontWeight: active ? FontWeight.w600 : FontWeight.w500,
             ),
           ),
         ),

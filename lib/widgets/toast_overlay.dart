@@ -14,7 +14,6 @@ class _ToastOverlayState extends State<ToastOverlay>
     with SingleTickerProviderStateMixin {
   late AnimationController _controller;
   late Animation<double> _fadeAnim;
-  String _lastMessage = '';
   bool _hiding = false;
 
   @override
@@ -32,18 +31,21 @@ class _ToastOverlayState extends State<ToastOverlay>
     });
   }
 
+  String _prevMessage = '';
+
   @override
   void didChangeDependencies() {
     super.didChangeDependencies();
     final state = context.watch<AppState>();
-    if (state.toastMessage.isNotEmpty) {
-      _lastMessage = state.toastMessage;
+    final msg = state.toastMessage;
+    if (msg.isNotEmpty && msg != _prevMessage) {
+      _prevMessage = msg;
       _hiding = false;
       _controller.forward(from: 0.0);
-    } else if (_lastMessage.isNotEmpty && !_hiding) {
+    } else if (msg.isEmpty && _prevMessage.isNotEmpty && !_hiding) {
       _hiding = true;
       _controller.reverse();
-      _lastMessage = '';
+      _prevMessage = '';
     }
   }
 

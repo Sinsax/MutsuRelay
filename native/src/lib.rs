@@ -8,7 +8,7 @@ use std::os::raw::c_char;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use vad::{resample_audio, rms, CONTEXT_SAMPLES, INTERIM_INTERVAL, MAX_SEGMENT_SAMPLES, VAD_FRAME_SAMPLES, VAD_MAX_SILENCE_FRAMES, VAD_MIN_SILENCE_FRAMES, VAD_MIN_SPEECH_FRAMES, VAD_HYSTERESIS};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{StreamConfig, BufferSize};
@@ -22,12 +22,13 @@ static AUDIO_LEVEL: OnceLock<Mutex<f32>> = OnceLock::new();
 static RECOGNITION_TEXT: OnceLock<Mutex<String>> = OnceLock::new();
 static MODEL_DIR: OnceLock<Mutex<String>> = OnceLock::new();
 static ASR_LANG: OnceLock<Mutex<String>> = OnceLock::new();
+static LAST_OUTPUT: OnceLock<Mutex<(String, Instant)>> = OnceLock::new();
 
 fn noise_gate() -> &'static Mutex<f32> {
-    NOISE_GATE.get_or_init(|| Mutex::new(0.01))
+    NOISE_GATE.get_or_init(|| Mutex::new(0.02))
 }
 fn censor_mode() -> &'static Mutex<i32> {
-    CENSOR_MODE.get_or_init(|| Mutex::new(0))
+    CENSOR_MODE.get_or_init(|| Mutex::new(2))
 }
 fn noise_suppress() -> &'static AtomicBool {
     NOISE_SUPPRESS.get_or_init(|| AtomicBool::new(true))
@@ -42,7 +43,10 @@ fn model_dir() -> &'static Mutex<String> {
     MODEL_DIR.get_or_init(|| Mutex::new(String::new()))
 }
 fn asr_lang() -> &'static Mutex<String> {
-    ASR_LANG.get_or_init(|| Mutex::new("auto".to_string()))
+    ASR_LANG.get_or_init(|| Mutex::new("zh".to_string()))
+}
+fn last_output() -> &'static Mutex<(String, Instant)> {
+    LAST_OUTPUT.get_or_init(|| Mutex::new((String::new(), Instant::now())))
 }
 
 const ASR_SAMPLE_RATE: u32 = 16000;
@@ -78,11 +82,13 @@ pub extern "C" fn mutsurelay_init_asr(model_dir_ptr: *const c_char) -> i32 {
 fn _init_internal(model_dir_ptr: *const c_char) -> i32 {
     let dir = if model_dir_ptr.is_null() { String::new() } else { unsafe { CStr::from_ptr(model_dir_ptr) }.to_string_lossy().to_string() };
     if let Ok(mut m) = model_dir().lock() { *m = dir; }
+    censor::reload_blocklist();
     if let Ok(cfg) = bilive::Config::load() {
         if let Ok(mut g) = noise_gate().lock() { *g = cfg.noise_gate; }
         if let Ok(mut m) = censor_mode().lock() { *m = cfg.censor_mode; }
         noise_suppress().store(cfg.noise_suppress, Ordering::SeqCst);
         bilive::init_from_config(&cfg);
+        if let Ok(mut a) = asr_lang().lock() { *a = bilive::get_language(); }
     }
     INITIALIZED.store(true, Ordering::SeqCst);
     0
@@ -187,12 +193,12 @@ fn run_recording_pipeline() -> Option<()> {
     let mut ring_buf = Vec::with_capacity(CONTEXT_SAMPLES * 2);
     let mut seg_buf = Vec::with_capacity(MAX_SEGMENT_SAMPLES);
     let mut in_speech = false;
-    let mut speech_frames: u32 = 0;
+    let mut consecutive_speech: u32 = 0;
+    let mut max_consecutive_speech: u32 = 0;
     let mut silence_frames: u32 = 0;
     let mut leftover = Vec::new();
     let mut interim_frame: u32 = 0;
     let mut noise_raw: f32 = 0.01;
-    let mut noise_floor: f32 = 0.01;
     let models = find_asr_model();
 
     println!("[rust] models found: {:?}", models.is_some());
@@ -231,7 +237,7 @@ fn run_recording_pipeline() -> Option<()> {
 
         // Peak for level meter (scale up for visibility)
         let peak = chunk.iter().fold(0.0_f32, |acc, s| acc.max(s.abs()));
-        if let Ok(mut l) = audio_level().lock() { *l = (peak * 6.0).min(1.0); }
+        if let Ok(mut l) = audio_level().lock() { *l = (peak * 2.0).min(1.0); }
 
         // Convert stereo to mono
         let mono = if channels > 1 {
@@ -262,18 +268,19 @@ fn run_recording_pipeline() -> Option<()> {
             let frame: Vec<f32> = leftover.drain(..VAD_FRAME_SAMPLES).collect();
             let raw_energy = rms(&frame);
 
-            // Only update noise floor when NOT speaking (matches Tauri)
-            if !in_speech {
-                noise_raw = noise_raw * 0.95 + raw_energy * 0.05;
-                noise_floor = noise_raw * 1.5;
-            }
+            // Adaptive noise floor (slower update during speech)
+            let noise_rate = if in_speech { 0.999 } else { 0.95 };
+            noise_raw = noise_raw * noise_rate + raw_energy * (1.0 - noise_rate);
 
             // Denoising gain (matches Tauri)
-            let signal_ratio = raw_energy / noise_floor.max(0.0001);
-            let gain = if signal_ratio < 0.5 {
+            let signal_ratio = raw_energy / (noise_raw * 1.5).max(0.0001);
+            let suppress = noise_suppress().load(Ordering::SeqCst);
+            let gain = if !suppress {
+                1.0
+            } else if signal_ratio < 0.5 {
                 0.1 + signal_ratio * 0.3
             } else if signal_ratio < 1.5 {
-                0.4 + (signal_ratio - 0.5) * 0.5
+                0.25 + (signal_ratio - 0.5) * 0.75
             } else {
                 1.0
             };
@@ -289,10 +296,12 @@ fn run_recording_pipeline() -> Option<()> {
             if audio_active {
                 if !in_speech {
                     in_speech = true;
-                    speech_frames = 1;
+                    consecutive_speech = 1;
+                    max_consecutive_speech = max_consecutive_speech.max(consecutive_speech);
                     interim_frame = 0;
                 } else {
-                    speech_frames += 1;
+                    consecutive_speech += 1;
+                    max_consecutive_speech = max_consecutive_speech.max(consecutive_speech);
                 }
                 silence_frames = 0;
                 seg_buf.extend_from_slice(&denoised);
@@ -304,33 +313,103 @@ fn run_recording_pipeline() -> Option<()> {
             } else if in_speech {
                 silence_frames += 1;
                 seg_buf.extend_from_slice(&denoised);
+                max_consecutive_speech = max_consecutive_speech.max(consecutive_speech);
+                consecutive_speech = 0;
                 if silence_frames >= VAD_MIN_SILENCE_FRAMES {
-                    let push_now = speech_frames >= VAD_MIN_SPEECH_FRAMES || silence_frames >= VAD_MAX_SILENCE_FRAMES;
+                    let push_now = max_consecutive_speech >= VAD_MIN_SPEECH_FRAMES || silence_frames >= VAD_MAX_SILENCE_FRAMES;
                     if push_now {
-                        if let Some(ref r) = recognizer { process_segment(&ring_buf, &seg_buf, r, true); }
+                        if max_consecutive_speech >= VAD_MIN_SPEECH_FRAMES {
+                            if let Some(ref r) = recognizer { process_segment(&ring_buf, &seg_buf, r, true); }
+                        }
                         seg_buf.clear();
-                        in_speech = false; speech_frames = 0; silence_frames = 0; interim_frame = 0;
+                        in_speech = false; consecutive_speech = 0; max_consecutive_speech = 0; silence_frames = 0; interim_frame = 0;
                     }
                 }
             }
 
             if seg_buf.len() >= MAX_SEGMENT_SAMPLES && in_speech {
-                if let Some(ref r) = recognizer { process_segment(&ring_buf, &seg_buf, r, true); }
+                if max_consecutive_speech >= VAD_MIN_SPEECH_FRAMES {
+                    if let Some(ref r) = recognizer { process_segment(&ring_buf, &seg_buf, r, true); }
+                }
                 seg_buf.clear();
-                in_speech = false; speech_frames = 0; silence_frames = 0; interim_frame = 0;
+                in_speech = false; consecutive_speech = 0; max_consecutive_speech = 0; silence_frames = 0; interim_frame = 0;
             }
 
             if frame_count % 100 == 0 {
-                println!("[rust] frame {}: in_speech={in_speech}, energy={energy:.4}, threshold={threshold:.4}, noise_floor={noise_floor:.4}", frame_count);
+                println!("[rust] frame {}: in_speech={in_speech}, energy={energy:.4}, threshold={threshold:.4}, noise_floor={:.4}", frame_count, noise_raw * 1.5);
             }
         }
     }
 
-    println!("[rust] loop exited, finalizing (in_speech={in_speech}, speech_frames={speech_frames})");
-    if in_speech && speech_frames >= VAD_MIN_SPEECH_FRAMES {
+    max_consecutive_speech = max_consecutive_speech.max(consecutive_speech);
+    println!("[rust] loop exited, finalizing (in_speech={in_speech}, max_consecutive_speech={max_consecutive_speech})");
+    if in_speech && max_consecutive_speech >= VAD_MIN_SPEECH_FRAMES {
         if let Some(ref r) = recognizer { process_segment(&ring_buf, &seg_buf, r, true); }
     }
     Some(())
+}
+
+fn is_repetitive(text: &str) -> bool {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() < 4 { return false; }
+    let mut max_count = 0u32;
+    let mut seen: Vec<(char, u32)> = Vec::new();
+    for &c in &chars {
+        if let Some(pos) = seen.iter().position(|&(ch, _)| ch == c) {
+            seen[pos].1 += 1;
+            if seen[pos].1 > max_count { max_count = seen[pos].1; }
+        } else {
+            seen.push((c, 1));
+            if 1 > max_count { max_count = 1; }
+        }
+    }
+    max_count as f32 / chars.len() as f32 > 0.55
+}
+
+fn split_sentence(text: &str) -> Vec<String> {
+    const SPLIT_MAX_LEN: usize = 15;
+    if text.chars().count() <= SPLIT_MAX_LEN {
+        return vec![text.to_string()];
+    }
+
+    let strong: &[char] = &['。', '！', '？', '\n'];
+    let soft: &[char] = &['，', '；', '、', '：', '）', '」', '』', '"'];
+    let particles: &[char] = &['的', '了', '在', '是', '我', '有', '和', '就', '不', '人'];
+
+    let chars: Vec<char> = text.chars().collect();
+    let mut parts: Vec<String> = Vec::new();
+    let mut start = 0;
+
+    while start < chars.len() {
+        let remaining = chars.len() - start;
+        if remaining <= SPLIT_MAX_LEN {
+            parts.push(chars[start..].iter().collect());
+            break;
+        }
+
+        let search_end = (start + SPLIT_MAX_LEN).min(chars.len());
+        let mut best = search_end;
+
+        if let Some(pos) = chars[start..search_end].iter().rposition(|c| strong.contains(c)) {
+            best = start + pos + 1;
+        } else if let Some(pos) = chars[start..search_end].iter().rposition(|c| soft.contains(c)) {
+            best = start + pos + 1;
+        } else {
+            let third = start + (search_end - start) * 2 / 3;
+            if let Some(pos) = chars[third..search_end].iter().rposition(|c| particles.contains(c)) {
+                best = third + pos + 1;
+            }
+        }
+
+        parts.push(chars[start..best].iter().collect());
+        start = best;
+
+        while start < chars.len() && (chars[start].is_whitespace() || matches!(chars[start], ' ' | '　' | '、')) {
+            start += 1;
+        }
+    }
+
+    parts
 }
 
 fn process_segment(ring_buf: &[f32], seg_buf: &[f32], recognizer: &sherpa_onnx::OfflineRecognizer, is_final: bool) {
@@ -369,12 +448,46 @@ fn process_segment(ring_buf: &[f32], seg_buf: &[f32], recognizer: &sherpa_onnx::
     }).to_string();
     if final_text.is_empty() { return; }
 
+    // Quality filtering
+    let chars_only: String = final_text.chars().filter(|c| {
+        !c.is_ascii_punctuation() && !"。，！？；、：…—·".contains(*c)
+    }).collect();
+    if !is_final {
+        if chars_only.len() < 2 { return; }
+        if is_repetitive(&chars_only) { return; }
+    } else {
+        if chars_only.len() < 2 {
+            println!("[rust] recognition filtered (punct only): {final_text}");
+            return;
+        }
+        if is_repetitive(&final_text) {
+            println!("[rust] recognition filtered (repetitive): {final_text}");
+            return;
+        }
+        // Dedup: skip identical text within 3 seconds
+        {
+            let mut last = last_output().lock().unwrap();
+            if last.0 == final_text && last.1.elapsed().as_secs() < 3 {
+                println!("[rust] recognition dedup skipped: {final_text}");
+                return;
+            }
+            last.0 = final_text.clone();
+            last.1 = Instant::now();
+        }
+    }
+
     let filtered = {
         let mode = censor_mode().lock().map(|m| *m).unwrap_or(0);
         if mode > 0 { censor::censor(&final_text, mode) } else { final_text.clone() }
     };
 
     println!("[rust] recognition {tag}: {filtered}");
+    if is_final {
+        for sentence in split_sentence(&filtered) {
+            bilive::write_subtitle_text(&sentence);
+        }
+    }
+    // Send result as JSON with full text (filtered, not split)
     let json = serde_json::json!({"type": tag, "text": filtered}).to_string();
     if let Ok(mut r) = recognition_text().lock() {
         *r = json;
@@ -511,12 +624,14 @@ pub extern "C" fn mutsurelay_get_room_id() -> i64 { bilive::get_room_id() as i64
 #[no_mangle]
 pub extern "C" fn mutsurelay_set_asr_lang(lang: *const c_char) {
     let l = if lang.is_null() { "auto".to_string() } else { unsafe { CStr::from_ptr(lang) }.to_string_lossy().to_string() };
-    if let Ok(mut a) = asr_lang().lock() { *a = l; }
+    if let Ok(mut a) = asr_lang().lock() { *a = l.clone(); }
+    bilive::set_language(&l);
 }
 
 #[no_mangle]
 pub extern "C" fn mutsurelay_get_asr_lang() -> *mut c_char {
-    CString::new(bilive::get_language()).unwrap_or_default().into_raw()
+    let s = asr_lang().lock().map(|l| l.clone()).unwrap_or_default();
+    CString::new(s).unwrap_or_default().into_raw()
 }
 
 #[no_mangle]
@@ -546,6 +661,27 @@ pub extern "C" fn mutsurelay_get_last_error() -> *mut c_char {
     CString::new(bilive::get_last_error()).unwrap_or_default().into_raw()
 }
 
+#[no_mangle]
+pub extern "C" fn mutsurelay_set_subtitle_file_path(path: *const c_char) {
+    let p = if path.is_null() { String::new() } else { unsafe { CStr::from_ptr(path) }.to_string_lossy().to_string() };
+    bilive::set_subtitle_file_path(&p);
+}
+
+#[no_mangle]
+pub extern "C" fn mutsurelay_get_subtitle_file_path() -> *mut c_char {
+    CString::new(bilive::get_subtitle_file_path()).unwrap_or_default().into_raw()
+}
+
+#[no_mangle]
+pub extern "C" fn mutsurelay_set_memory_sensitivity(val: f64) {
+    bilive::set_memory_sensitivity(val as f32);
+}
+
+#[no_mangle]
+pub extern "C" fn mutsurelay_get_memory_sensitivity() -> f64 {
+    bilive::get_memory_sensitivity() as f64
+}
+
 // ---- Config persistence ----
 
 #[no_mangle]
@@ -557,6 +693,8 @@ pub extern "C" fn mutsurelay_save_config() -> i32 {
     cfg.noise_suppress = noise_suppress().load(Ordering::SeqCst);
     cfg.language = bilive::get_language();
     cfg.close_behavior = bilive::get_close_behavior();
+    cfg.subtitle_file_path = bilive::get_subtitle_file_path();
+    cfg.memory_sensitivity = bilive::get_memory_sensitivity();
     cfg.save().map(|_| 0).unwrap_or(-1)
 }
 
@@ -570,7 +708,10 @@ pub extern "C" fn mutsurelay_load_config() -> i32 {
             bilive::set_language(&cfg.language);
             bilive::set_close_behavior(&cfg.close_behavior);
             if cfg.roomid > 0 { bilive::set_room_id(cfg.roomid); }
+            bilive::set_subtitle_file_path(&cfg.subtitle_file_path);
+            bilive::set_memory_sensitivity(cfg.memory_sensitivity);
             bilive::init_from_config(&cfg);
+            if let Ok(mut a) = asr_lang().lock() { *a = bilive::get_language(); }
             0
         }
         Err(_) => -1,

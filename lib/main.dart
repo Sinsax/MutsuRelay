@@ -90,7 +90,7 @@ Future<String> _generateTrayIconPath() async {
     }
     icoBytes = _buildIcoFromBgra(bgra.toBytes(), w, h);
   }
-  final icoFile = File('${Directory.systemTemp.path}\\mutsurelay_tray.ico');
+  final icoFile = File('${Directory.systemTemp.path}/mutsurelay_tray.ico');
   await icoFile.writeAsBytes(icoBytes);
   return icoFile.path;
 }
@@ -99,14 +99,18 @@ Future<String> _generateTrayIconPath() async {
 
 class _TrayHandler with TrayListener {
   final AppState appState;
+  bool _windowVisible = true;
 
   _TrayHandler(this.appState);
 
   @override
   void onTrayIconMouseDown() async {
-    if (await windowManager.isVisible()) {
-      await windowManager.hide();
+    if (_windowVisible) {
+      _windowVisible = false;
+      await windowManager.setOpacity(0.0);
     } else {
+      _windowVisible = true;
+      await windowManager.setOpacity(1.0);
       await windowManager.show();
       await windowManager.focus();
     }
@@ -133,6 +137,7 @@ Future<void> _initTray(AppState appState, String iconPath) async {
         key: 'show',
         label: '显示',
         onClick: (_) async {
+          await windowManager.setOpacity(1.0);
           await windowManager.show();
           await windowManager.focus();
         },
@@ -197,9 +202,18 @@ void main() async {
   String findModelDir() {
     if (Directory('asr/model').existsSync()) return 'asr/model';
     final exeDir = File(Platform.resolvedExecutable).parent;
-    for (final dir in ['asr/model', '../asr/model', '../../asr/model']) {
-      final p = '${exeDir.path}\\$dir';
-      if (Directory(p).existsSync() && File('$p\\model.int8.onnx').existsSync()) {
+    final candidates = <String>[];
+    if (Platform.isWindows) {
+      candidates.add('asr/model');
+    } else if (Platform.isLinux) {
+      candidates.add('lib/asr/model');
+    } else if (Platform.isMacOS) {
+      candidates.add('../Resources/asr/model');
+    }
+    candidates.addAll(['asr/model', '../asr/model']);
+    for (final dir in candidates) {
+      final p = '${exeDir.path}/$dir';
+      if (Directory(p).existsSync() && File('$p/model.int8.onnx').existsSync()) {
         return p;
       }
     }
@@ -224,6 +238,7 @@ void main() async {
       await _initTray(appState, iconPath);
     } catch (e) {
       debugPrint('Tray init error: $e');
+      appState.trayAvailable = false;
     }
   });
 }
