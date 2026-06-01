@@ -67,7 +67,7 @@ Future<void> _packageWindows(String version) async {
     '-Path',
     'build\\windows\\x64\\runner\\Release\\*',
     '-DestinationPath',
-    'dist\\MutsuRelay-$version.zip',
+    'dist\\MutsuRelay-windows-x64-$version.zip',
     '-CompressionLevel',
     'Optimal',
     '-Force',
@@ -126,7 +126,7 @@ Future<void> _packageLinux(String version) async {
   }
 
   final outDir = Directory('dist')..createSync(recursive: true);
-  final outPath = 'dist/MutsuRelay-$version.AppImage';
+  final outPath = 'dist/MutsuRelay-linux-x86_64-$version.AppImage';
   final env = Map<String, String>.from(Platform.environment)
     ..['APPIMAGE_EXTRACT_AND_RUN'] = '1';
   await _run('appimagetool', [bundleDir, outPath], env: env);
@@ -154,7 +154,7 @@ Future<void> _packageLinux(String version) async {
   );
   await Process.run('chmod', ['+x', runScript.path]);
 
-  final targzPath = 'dist/MutsuRelay-$version.tar.gz';
+  final targzPath = 'dist/MutsuRelay-linux-x86_64-$version.tar.gz';
   final result = await Process.run('tar', [
     '-czf', targzPath,
     '-C', 'build/linux/x64/release/targz',
