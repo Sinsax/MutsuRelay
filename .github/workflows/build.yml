@@ -3,6 +3,7 @@ name: Build
 on:
   push:
     branches: [main, master, test]
+    tags: [v*]
   pull_request:
     branches: [main, master]
   workflow_dispatch:
@@ -60,6 +61,12 @@ jobs:
       - name: Flutter pub get
         run: flutter pub get
 
+      - name: Extract version
+        shell: bash
+        run: |
+          ver=$(grep '^version: ' pubspec.yaml | sed 's/version: //' | sed 's/+.*//')
+          echo "VERSION=$ver" >> $GITHUB_ENV
+
       - name: Build Flutter Windows (release)
         run: flutter build windows --release
 
@@ -67,23 +74,23 @@ jobs:
         run: choco install innosetup --no-progress
 
       - name: Create Inno Setup installer
-        run: iscc windows\installer\setup.iss
+        run: iscc /DMyAppVersion=${{ env.VERSION }} windows\installer\setup.iss
 
       - name: Create ZIP package
         run: |
           New-Item -ItemType Directory -Path dist -Force
-          Compress-Archive -Path "build\windows\x64\runner\Release\*" -DestinationPath "dist\MutsuRelay-1.0.1.zip" -CompressionLevel Optimal
+          Compress-Archive -Path "build\windows\x64\runner\Release\*" -DestinationPath "dist\mutsurelay-windows-x64.zip" -CompressionLevel Optimal
 
       - uses: actions/upload-artifact@v4
         with:
           name: mutsurelay-windows-x64
-          path: build\windows\x64\runner\Release\
-          compression-level: 6
+          path: dist\mutsurelay-windows-x64.zip
+          compression-level: 0
 
       - uses: actions/upload-artifact@v4
         with:
           name: mutsurelay-windows-x64-installer
-          path: dist\*
+          path: dist\MutsuRelay-*.exe
           compression-level: 0
 
   build-linux:
@@ -121,6 +128,12 @@ jobs:
       - name: Flutter pub get
         run: flutter pub get
 
+      - name: Extract version
+        shell: bash
+        run: |
+          ver=$(grep '^version: ' pubspec.yaml | sed 's/version: //' | sed 's/+.*//')
+          echo "VERSION=$ver" >> $GITHUB_ENV
+
       - name: Install appimagetool
         run: |
           wget -q "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage" -O /usr/local/bin/appimagetool
@@ -135,15 +148,43 @@ jobs:
           APPIMAGE_EXTRACT_AND_RUN: 1
           LD_LIBRARY_PATH: build/linux/x64/release/bundle/lib
 
+      - name: Create Linux portable ZIP
+        run: |
+          mkdir -p dist
+          cd build/linux/x64/release/bundle && zip -r ../../../../dist/mutsurelay-linux-x64.zip .
+
       - uses: actions/upload-artifact@v4
         with:
           name: mutsurelay-linux-x64
-          path: build/linux/x64/release/bundle/
-          compression-level: 6
+          path: dist/mutsurelay-linux-x64.zip
+          compression-level: 0
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release-assets
+          find . -name "*.AppImage" -exec cp {} release-assets/mutsurelay-${{ env.VERSION }}-linux.AppImage \;
 
       - uses: actions/upload-artifact@v4
         with:
           name: mutsurelay-linux-x64-appimage
-          path: |
-            **/*.AppImage
-            dist/**/*
+          path: release-assets/
+          compression-level: 0
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            mutsurelay-windows-x64/*
+            mutsurelay-windows-x64-installer/*
+            mutsurelay-linux-x64/*
+            mutsurelay-linux-x64-appimage/*
+          generate_release_notes: true
