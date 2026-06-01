@@ -181,7 +181,7 @@ String _readVersion() {
       if (m != null) return m.group(1)!;
     }
   } catch (_) {}
-  return '1.0.0';
+  return '1.0.1';
 }
 
 Future<({String cmd, List<String> baseArgs})> _resolveFlutter() async {

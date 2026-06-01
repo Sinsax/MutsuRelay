@@ -21,7 +21,8 @@ class VadSlider extends StatelessWidget {
                 activeTrackColor: AppColors.primary,
                 inactiveTrackColor: const Color(0x335BC0BE),
                 thumbColor: AppColors.primary,
-                overlayColor: AppColors.primary.withValues(alpha: 0.1),
+                overlayColor: Colors.transparent,
+                overlayShape: const RoundSliderOverlayShape(overlayRadius: 0),
                 thumbShape: _VadThumbShape(),
                 trackShape: const RoundedRectSliderTrackShape(),
                 rangeThumbShape: const RoundRangeSliderThumbShape(),
@@ -47,7 +48,7 @@ class VadSlider extends StatelessWidget {
 class _VadThumbShape extends SliderComponentShape {
   @override
   Size getPreferredSize(bool isEnabled, bool isDiscrete) {
-    return const Size(16, 16);
+    return const Size(12, 12);
   }
 
   @override

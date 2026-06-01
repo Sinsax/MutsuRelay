@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:window_manager/window_manager.dart';
 import 'package:tray_manager/tray_manager.dart';
+import '../models/user_info.dart';
 import '../providers/app_state.dart';
 import '../ffi/native_bridge.dart';
 import '../theme/app_theme.dart';
@@ -11,9 +12,19 @@ class TopBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Consumer<AppState>(
-      builder: (context, state, _) {
-        final isMini = state.windowMode == WindowMode.mini;
+    return Selector<AppState, ({WindowMode windowMode, bool cookieStatus, UserInfo? userInfo, bool isConnected, bool isRecording, CloseBehavior closeBehavior, bool alwaysOnTop})>(
+      selector: (_, state) => (
+        windowMode: state.windowMode,
+        cookieStatus: state.cookieStatus,
+        userInfo: state.userInfo,
+        isConnected: state.isConnected,
+        isRecording: state.isRecording,
+        closeBehavior: state.closeBehavior,
+        alwaysOnTop: state.alwaysOnTop,
+      ),
+      builder: (context, data, _) {
+        final state = context.read<AppState>();
+        final isMini = data.windowMode == WindowMode.mini;
 
         return Container(
           height: AppInsets.headerH,
@@ -41,8 +52,8 @@ class TopBar extends StatelessWidget {
                       child: Row(
                         children: [
                           Expanded(
-                            child: state.windowMode == WindowMode.normal
-                                ? _normalModeContent(state)
+                            child: data.windowMode == WindowMode.normal
+                                ? _normalModeContent(data)
                                 : _miniModeContent(),
                           ),
                         ],
@@ -52,6 +63,15 @@ class TopBar extends StatelessWidget {
                 ),
               ),
               // Action buttons
+              if (!isMini) ...[
+                _iconBtn(
+                  data.alwaysOnTop ? Icons.push_pin : Icons.push_pin_outlined,
+                  data.alwaysOnTop ? '取消置顶' : '窗口置顶',
+                  () => state.toggleAlwaysOnTop(),
+                  false,
+                ),
+                const SizedBox(width: 2),
+              ],
               _iconBtn(
                 Icons.settings_rounded,
                 '设置',
@@ -68,7 +88,7 @@ class TopBar extends StatelessWidget {
                 isMini,
               ),
               const SizedBox(width: 2),
-              _winButtons(state, isMini),
+              _winButtons(data.closeBehavior, isMini),
             ],
           ),
         );
@@ -84,7 +104,7 @@ class TopBar extends StatelessWidget {
     );
   }
 
-  Widget _normalModeContent(AppState state) {
+  Widget _normalModeContent(({WindowMode windowMode, bool cookieStatus, UserInfo? userInfo, bool isConnected, bool isRecording, CloseBehavior closeBehavior, bool alwaysOnTop}) data) {
     return Row(
       children: [
         _brand(),
@@ -94,23 +114,23 @@ class TopBar extends StatelessWidget {
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
               _statusBadge(
-                active: state.cookieStatus,
-                label: state.cookieStatus
-                    ? (state.userInfo?.uname ?? '已登录')
+                active: data.cookieStatus,
+                label: data.cookieStatus
+                    ? (data.userInfo?.uname ?? '已登录')
                     : '未登录',
-                icon: state.cookieStatus ? Icons.person : Icons.person_outline,
+                icon: data.cookieStatus ? Icons.person : Icons.person_outline,
               ),
               const SizedBox(width: 10),
               _statusBadge(
-                active: state.isConnected,
-                label: state.isConnected ? '已连接' : '未连接',
-                icon: state.isConnected ? Icons.wifi : Icons.wifi_off_rounded,
+                active: data.isConnected,
+                label: data.isConnected ? '已连接' : '未连接',
+                icon: data.isConnected ? Icons.wifi : Icons.wifi_off_rounded,
               ),
               const SizedBox(width: 10),
               _statusBadge(
-                active: state.isRecording,
-                label: state.isRecording ? '识别中' : '未识别',
-                icon: state.isRecording ? Icons.mic : Icons.mic_none_rounded,
+                active: data.isRecording,
+                label: data.isRecording ? '识别中' : '未识别',
+                icon: data.isRecording ? Icons.mic : Icons.mic_none_rounded,
               ),
             ],
           ),
@@ -136,7 +156,7 @@ class TopBar extends StatelessWidget {
         const SizedBox(width: 6),
         Text(
           'MutsuRelay',
-          style: compact ? AppTextStyles.miniTitle : AppTextStyles.logo,
+          style: compact ? AppTextStyles.miniTitle.copyWith(color: Colors.white) : AppTextStyles.logo,
         ),
         if (!compact) const SizedBox(width: 12),
       ],
@@ -211,7 +231,7 @@ class TopBar extends StatelessWidget {
     );
   }
 
-  Widget _winButtons(AppState state, bool isMini) {
+  Widget _winButtons(CloseBehavior closeBehavior, bool isMini) {
     final baseColor = isMini ? AppColors.textDark : AppColors.textSecondary;
     return Row(
       mainAxisSize: MainAxisSize.min,
@@ -228,7 +248,7 @@ class TopBar extends StatelessWidget {
         _winBtn(
           Icons.close_rounded,
           '关闭',
-          _closeWindow(state),
+          _closeWindow(closeBehavior),
           baseColor,
           isMini,
           AppColors.danger,
@@ -237,9 +257,9 @@ class TopBar extends StatelessWidget {
     );
   }
 
-  VoidCallback _closeWindow(AppState state) {
+  VoidCallback _closeWindow(CloseBehavior closeBehavior) {
     return () {
-      if (state.closeBehavior == CloseBehavior.exit) {
+      if (closeBehavior == CloseBehavior.exit) {
         NativeBridge.instance.shutdown();
         trayManager.destroy();
         windowManager.destroy();

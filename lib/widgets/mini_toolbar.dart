@@ -8,8 +8,16 @@ class MiniToolbar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Consumer<AppState>(
-      builder: (context, state, _) {
+    return Selector<AppState, ({bool isRecording, SendMode sendMode, bool invertMiniText, double miniOpacity, bool alwaysOnTop})>(
+      selector: (_, state) => (
+        isRecording: state.isRecording,
+        sendMode: state.sendMode,
+        invertMiniText: state.invertMiniText,
+        miniOpacity: state.miniOpacity,
+        alwaysOnTop: state.alwaysOnTop,
+      ),
+      builder: (context, data, _) {
+        final state = context.read<AppState>();
         return Container(
           height: AppInsets.miniToolbarH,
           padding: const EdgeInsets.symmetric(horizontal: 10),
@@ -22,10 +30,12 @@ class MiniToolbar extends StatelessWidget {
           child: Row(
             children: [
               _miniMicBtn(state),
-              const SizedBox(width: 8),
+              const SizedBox(width: 4),
               _miniModeToggle(state),
-              _miniSettingsBtn(context),
+              const SizedBox(width: 4),
               _miniInvertBtn(state),
+              const SizedBox(width: 4),
+              _miniPinBtn(state),
               const SizedBox(width: 4),
               Expanded(child: _opacitySlider(state)),
             ],
@@ -68,34 +78,8 @@ class MiniToolbar extends StatelessWidget {
     );
   }
 
-  Widget _miniSettingsBtn(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.only(left: 6),
-      child: Material(
-        color: Colors.transparent,
-        shape: const CircleBorder(),
-        child: InkWell(
-          customBorder: const CircleBorder(),
-          onTap: () => context.read<AppState>().showSettings = true,
-          child: Container(
-            width: 22,
-            height: 22,
-            alignment: Alignment.center,
-            child: const Icon(
-              Icons.settings_rounded,
-              size: 13,
-              color: Colors.white,
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
   Widget _miniInvertBtn(AppState state) {
-    return Padding(
-      padding: const EdgeInsets.only(left: 4),
-      child: GestureDetector(
+    return GestureDetector(
         onTap: () => state.toggleInvertMiniText(),
         child: Container(
           width: 20,
@@ -118,8 +102,7 @@ class MiniToolbar extends StatelessWidget {
             ),
           ),
         ),
-      ),
-    );
+      );
   }
 
   Widget _miniModeToggle(AppState state) {
@@ -170,16 +153,38 @@ class MiniToolbar extends StatelessWidget {
     );
   }
 
+  Widget _miniPinBtn(AppState state) {
+    return Material(
+        color: Colors.transparent,
+        shape: const CircleBorder(),
+        child: InkWell(
+          customBorder: const CircleBorder(),
+          onTap: () => state.toggleAlwaysOnTop(),
+          child: Container(
+            width: 22,
+            height: 22,
+            alignment: Alignment.center,
+            child: Icon(
+              state.alwaysOnTop ? Icons.push_pin : Icons.push_pin_outlined,
+              size: 14,
+              color: Colors.white,
+            ),
+          ),
+        ),
+      );
+  }
+
   Widget _opacitySlider(AppState state) {
     return SliderTheme(
       data: SliderThemeData(
         trackHeight: 3,
-        activeTrackColor: AppColors.primary,
-        inactiveTrackColor: const Color(0x4D5BC0BE),
-        thumbColor: AppColors.primary,
+        activeTrackColor: Colors.white,
+        inactiveTrackColor: Colors.white.withValues(alpha: 0.3),
+        thumbColor: Colors.white,
         thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 4),
         trackShape: const RoundedRectSliderTrackShape(),
         overlayColor: Colors.transparent,
+        overlayShape: const RoundSliderOverlayShape(overlayRadius: 0),
       ),
       child: Slider(
         min: 0.15,

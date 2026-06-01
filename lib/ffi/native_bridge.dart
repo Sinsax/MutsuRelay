@@ -1,3 +1,4 @@
+import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
 import 'package:ffi/ffi.dart';
@@ -116,6 +117,9 @@ typedef MutsuRelayGetAudioLevelDart = double Function();
 
 typedef MutsuRelayGetRecognitionResultC = Pointer<Utf8> Function();
 typedef MutsuRelayGetRecognitionResultDart = Pointer<Utf8> Function();
+
+typedef MutsuRelayPollRecordingC = Pointer<Utf8> Function();
+typedef MutsuRelayPollRecordingDart = Pointer<Utf8> Function();
 
 typedef MutsuRelayDownloadAsrModelC = Int32 Function(Pointer<Utf8> url, Pointer<Utf8> destDir);
 typedef MutsuRelayDownloadAsrModelDart = int Function(Pointer<Utf8> url, Pointer<Utf8> destDir);
@@ -252,6 +256,7 @@ class NativeBridge {
   late MutsuRelayLoadConfigDart _loadConfig;
   late MutsuRelayGetAudioLevelDart _getAudioLevel;
   late MutsuRelayGetRecognitionResultDart _getRecognitionResult;
+  late MutsuRelayPollRecordingDart _pollRecording;
   late MutsuRelayDownloadAsrModelDart _downloadAsrModel;
   late MutsuRelaySetSubtitleFilePathDart _setSubtitleFilePath;
   late MutsuRelayGetSubtitleFilePathDart _getSubtitleFilePath;
@@ -416,6 +421,10 @@ class NativeBridge {
           MutsuRelayGetRecognitionResultC,
           MutsuRelayGetRecognitionResultDart
         >('mutsurelay_get_recognition_result');
+    _pollRecording = _lib
+        .lookupFunction<MutsuRelayPollRecordingC, MutsuRelayPollRecordingDart>(
+          'mutsurelay_poll_recording',
+        );
     _downloadAsrModel = _lib
         .lookupFunction<
           MutsuRelayDownloadAsrModelC,
@@ -652,6 +661,19 @@ class NativeBridge {
     final text = ptr.toDartString();
     _freeString(ptr);
     return text;
+  }
+
+  Map<String, dynamic>? pollRecording() {
+    if (!_initialized) return null;
+    final ptr = _pollRecording();
+    if (ptr == nullptr) return null;
+    final json = ptr.toDartString();
+    _freeString(ptr);
+    try {
+      return jsonDecode(json) as Map<String, dynamic>;
+    } catch (_) {
+      return null;
+    }
   }
 
   int downloadAsrModel(String url, String destDir) {

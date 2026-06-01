@@ -11,6 +11,7 @@ AppId={{98E2FCB0-9904-4727-A97C-DE5B7C71DF8F}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
+AppMutex=Global\Mutsurelay-{98E2FCB0-9904-4727-A97C-DE5B7C71DF8F}
 DefaultDirName={userpf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 UninstallDisplayIcon={app}\mutsurelay.exe

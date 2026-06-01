@@ -45,6 +45,7 @@ class AppState extends ChangeNotifier {
       bridge.stopRecording();
       _liveText = '';
       _audioLevel = 0.0;
+      audioLevelNotifier.value = 0.0;
       _isRecording = false;
     }
     notifyListeners();
@@ -52,34 +53,39 @@ class AppState extends ChangeNotifier {
 
   void _startPolling() {
     _recordingPollTimer?.cancel();
-    _recordingPollTimer = Timer.periodic(const Duration(milliseconds: 100), (_) {
+    _recordingPollTimer = Timer.periodic(const Duration(milliseconds: 50), (_) {
       final bridge = NativeBridge.instance;
-      if (bridge.isRecording() == 0) {
+      final poll = bridge.pollRecording();
+      if (poll == null || poll['recording'] != true) {
         _isRecording = false;
         _audioLevel = 0.0;
+        audioLevelNotifier.value = 0.0;
         _liveText = '';
         _recordingPollTimer?.cancel();
         notifyListeners();
         return;
       }
-      _audioLevel = bridge.getAudioLevel();
-      final result = bridge.getRecognitionResult();
-      if (result != null && result.isNotEmpty) {
-        try {
-          final data = jsonDecode(result) as Map<String, dynamic>;
-          final type = data['type'] as String? ?? '';
-          final text = data['text'] as String? ?? '';
-          if (text.isNotEmpty) {
-            if (type == 'final') {
-              addSentence(text);
-              _liveText = '';
-            } else {
-              _liveText = text;
-            }
-          }
-        } catch (_) {}
+      _audioLevel = (poll['level'] as num?)?.toDouble() ?? 0.0;
+      audioLevelNotifier.value = _audioLevel;
+      var dataChanged = false;
+      final textData = poll['text'];
+      if (textData is Map<String, dynamic>) {
+        final text = textData['text'] as String? ?? '';
+        if (text.isNotEmpty) {
+          addSentence(text);
+          if (_liveText.isNotEmpty) dataChanged = true;
+          _liveText = '';
+        }
       }
-      notifyListeners();
+      final inSpeech = poll['in_speech'] == true;
+      if (inSpeech && _liveText.isEmpty) {
+        _liveText = '...';
+        dataChanged = true;
+      } else if (!inSpeech && _liveText == '...') {
+        _liveText = '';
+        dataChanged = true;
+      }
+      if (dataChanged) notifyListeners();
     });
   }
 
@@ -143,13 +149,10 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  // Audio
+  // Audio — separate ValueNotifier to avoid full tree rebuilds on every poll
+  final ValueNotifier<double> audioLevelNotifier = ValueNotifier(0.0);
   double _audioLevel = 0.0;
   double get audioLevel => _audioLevel;
-  set audioLevel(double value) {
-    _audioLevel = value;
-    notifyListeners();
-  }
 
   String _liveText = '';
   String get liveText => _liveText;
@@ -192,13 +195,22 @@ class AppState extends ChangeNotifier {
   WindowMode _windowMode = WindowMode.normal;
   WindowMode get windowMode => _windowMode;
 
+  bool _alwaysOnTop = false;
+  bool get alwaysOnTop => _alwaysOnTop;
+
+  Future<void> toggleAlwaysOnTop() async {
+    _alwaysOnTop = !_alwaysOnTop;
+    await windowManager.setAlwaysOnTop(_alwaysOnTop);
+    notifyListeners();
+  }
+
   Future<void> setWindowMode(WindowMode value) async {
     _windowMode = value;
+    _alwaysOnTop = value == WindowMode.mini;
     if (value == WindowMode.mini) {
       await windowManager.setMinimumSize(const Size(280, 320));
       await windowManager.setMaximumSize(const Size(400, 600));
       await windowManager.setSize(const Size(280, 380));
-      await windowManager.setAlwaysOnTop(true);
     } else {
       await windowManager.setMinimumSize(
         const Size(AppInsets.normalW, AppInsets.normalH),
@@ -207,8 +219,8 @@ class AppState extends ChangeNotifier {
       await windowManager.setSize(
         const Size(AppInsets.normalW, AppInsets.normalH),
       );
-      await windowManager.setAlwaysOnTop(false);
     }
+    await windowManager.setAlwaysOnTop(_alwaysOnTop);
     notifyListeners();
   }
 
@@ -236,7 +248,11 @@ class AppState extends ChangeNotifier {
   set showSettings(bool value) {
     if (_showSettings == value) return;
     _showSettings = value;
-    if (!value) restartAsr();
+    if (value) {
+      _asrSettingsDirty = false;
+    } else if (_asrSettingsDirty) {
+      restartAsr();
+    }
     notifyListeners();
   }
 
@@ -263,10 +279,14 @@ class AppState extends ChangeNotifier {
     saveSettings();
   }
 
+  bool _asrSettingsDirty = false;
+  bool get asrSettingsDirty => _asrSettingsDirty;
+
   CensorMode _censorMode = CensorMode.pinyin;
   CensorMode get censorMode => _censorMode;
   set censorMode(CensorMode value) {
     _censorMode = value;
+    _asrSettingsDirty = true;
     NativeBridge.instance.setCensorMode(value.index);
     notifyListeners();
     saveSettings();
@@ -276,6 +296,7 @@ class AppState extends ChangeNotifier {
   String get asrLang => _asrLang;
   set asrLang(String value) {
     _asrLang = value;
+    _asrSettingsDirty = true;
     notifyListeners();
     saveSettings();
   }
@@ -284,6 +305,7 @@ class AppState extends ChangeNotifier {
   bool get noiseSuppress => _noiseSuppress;
   set noiseSuppress(bool value) {
     _noiseSuppress = value;
+    _asrSettingsDirty = true;
     NativeBridge.instance.setNoiseSuppress(value);
     notifyListeners();
     saveSettings();
@@ -370,6 +392,9 @@ class AppState extends ChangeNotifier {
     _lastFinalTime = now;
     final item = SentenceItem(id: ++_sentenceId, text: text);
     _sentenceList.insert(0, item);
+    if (_sentenceList.length > 500) {
+      _sentenceList.removeLast();
+    }
 
     if (_sendMode == SendMode.auto && _isConnected && _cookieStatus) {
       final gen = _listGeneration;

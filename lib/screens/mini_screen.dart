@@ -10,15 +10,20 @@ class MiniScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Consumer<AppState>(
-      builder: (context, state, _) {
+    return Selector<AppState, ({bool invertMiniText, double miniOpacity})>(
+      selector: (_, state) => (
+        invertMiniText: state.invertMiniText,
+        miniOpacity: state.miniOpacity,
+      ),
+      builder: (context, data, _) {
+        final state = context.read<AppState>();
         return GestureDetector(
           onSecondaryTap: () => state.showSettings = true,
           child: Container(
             decoration: BoxDecoration(
-              color: state.invertMiniText
-                  ? const Color(0xFFDAF5F0).withValues(alpha: state.miniOpacity)
-                  : const Color(0xFF1A2E2A).withValues(alpha: state.miniOpacity),
+              color: data.invertMiniText
+                  ? const Color(0xFFDAF5F0).withValues(alpha: data.miniOpacity)
+                  : const Color(0xFF1A2E2A).withValues(alpha: data.miniOpacity),
               borderRadius: BorderRadius.circular(AppRadius.small),
             ),
             clipBehavior: Clip.antiAlias,

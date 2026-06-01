@@ -108,7 +108,7 @@ class AppInsets {
   static const padding = 12.0;
   static const gap = 12.0;
   static const smallGap = 6.0;
-  static const leftPanelW = 120.0;
+  static const leftPanelW = 130.0;
   static const rightPanelW = 140.0;
   static const normalW = 608.0;
   static const normalH = 320.0;

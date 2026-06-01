@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import '../models/user_info.dart';
 import '../providers/app_state.dart';
 import '../ffi/native_bridge.dart';
 import '../theme/app_theme.dart';
@@ -10,13 +11,24 @@ class SettingsModal extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Consumer<AppState>(
-      builder: (context, state, _) {
-        if (!state.showSettings) return const SizedBox.shrink();
+    return Selector<AppState, ({bool showSettings, bool cookieStatus, UserInfo? userInfo, bool asrRestarting, String asrLang, bool noiseSuppress, CensorMode censorMode, CloseBehavior closeBehavior})>(
+      selector: (_, state) => (
+        showSettings: state.showSettings,
+        cookieStatus: state.cookieStatus,
+        userInfo: state.userInfo,
+        asrRestarting: state.asrRestarting,
+        asrLang: state.asrLang,
+        noiseSuppress: state.noiseSuppress,
+        censorMode: state.censorMode,
+        closeBehavior: state.closeBehavior,
+      ),
+      builder: (context, data, _) {
+        final appState = context.read<AppState>();
+        if (!data.showSettings) return const SizedBox.shrink();
         return Stack(
           children: [
             GestureDetector(
-              onTap: () => state.showSettings = false,
+              onTap: () => appState.showSettings = false,
               child: Container(color: AppColors.overlayBg),
             ),
             Center(
@@ -35,12 +47,12 @@ class SettingsModal extends StatelessWidget {
                     children: [
                       const Text('账号', style: AppTextStyles.settingsSection),
                       const SizedBox(height: 4),
-                      if (state.cookieStatus)
-                        _loggedInSection(state)
+                      if (data.cookieStatus)
+                        _loggedInSection(data, appState)
                       else
                         _settingsRow(
                           'B站账号',
-                          _actionBtn('登录', () => state.showQrLogin = true),
+                          _actionBtn('登录', () => appState.showQrLogin = true),
                         ),
                       const SizedBox(height: 8),
                       _divider(),
@@ -48,7 +60,7 @@ class SettingsModal extends StatelessWidget {
                       Row(
                         children: [
                           const Text('语音识别', style: AppTextStyles.settingsSection),
-                          if (state.asrRestarting)
+                          if (data.asrRestarting)
                             Padding(
                               padding: const EdgeInsets.only(left: 6),
                               child: Text(
@@ -70,25 +82,21 @@ class SettingsModal extends StatelessWidget {
                         ],
                       ),
                       const SizedBox(height: 4),
-                      _languageRow(state),
+                      _languageRow(data, appState),
                       const SizedBox(height: 4),
-                      _noiseRow(context, state),
+                      _noiseRow(data, appState),
                       const SizedBox(height: 4),
-                      _censorModeRow(state),
+                      _censorModeRow(data, appState),
                       const SizedBox(height: 8),
                       _divider(),
                       const SizedBox(height: 8),
-                      const Text('文件', style: AppTextStyles.settingsSection),
+                      const Text('其他', style: AppTextStyles.settingsSection),
                       const SizedBox(height: 4),
                       _dataDirRow(context),
-                      const SizedBox(height: 8),
-                      _divider(),
-                      const SizedBox(height: 8),
-                      const Text('窗口', style: AppTextStyles.settingsSection),
                       const SizedBox(height: 4),
-                      _closeBehaviorRow(state),
+                      _closeBehaviorRow(data, appState),
                     ],
-                  ),
+                    ),
                 ),
               ),
             ),
@@ -98,7 +106,8 @@ class SettingsModal extends StatelessWidget {
     );
   }
 
-  Widget _loggedInSection(AppState state) {
+  Widget _loggedInSection(({bool showSettings, bool cookieStatus, UserInfo? userInfo, bool asrRestarting, String asrLang, bool noiseSuppress, CensorMode censorMode, CloseBehavior closeBehavior}) data, AppState appState) {
+    final bridge = NativeBridge.instance;
     return Container(
       padding: const EdgeInsets.symmetric(vertical: 2),
       child: Row(
@@ -121,16 +130,16 @@ class SettingsModal extends StatelessWidget {
               mainAxisSize: MainAxisSize.min,
               children: [
                 Text(
-                  state.userInfo?.uname ?? '已登录',
+                  data.userInfo?.uname ?? '已登录',
                   style: const TextStyle(
                     fontSize: 12,
                     fontWeight: FontWeight.w600,
                     color: AppColors.textDark,
                   ),
                 ),
-                if (state.userInfo != null)
+                if (data.userInfo != null)
                   Text(
-                    'UID: ${state.userInfo!.mid}',
+                    'UID: ${data.userInfo!.mid}',
                     style: const TextStyle(
                       fontSize: 10,
                       color: AppColors.textMuted,
@@ -140,9 +149,9 @@ class SettingsModal extends StatelessWidget {
             ),
           ),
           _logoutBtn(() {
-            NativeBridge.instance.logout();
-            state.cookieStatus = false;
-            state.userInfo = null;
+            bridge.logout();
+            appState.cookieStatus = false;
+            appState.userInfo = null;
           }),
         ],
       ),
@@ -172,40 +181,40 @@ class SettingsModal extends StatelessWidget {
     );
   }
 
-  Widget _closeBehaviorRow(AppState state) {
+  Widget _closeBehaviorRow(({bool showSettings, bool cookieStatus, UserInfo? userInfo, bool asrRestarting, String asrLang, bool noiseSuppress, CensorMode censorMode, CloseBehavior closeBehavior}) data, AppState appState) {
     return _settingsRow(
       '关闭窗口时',
       _toggleGroup<CloseBehavior>(
         [('退出', CloseBehavior.exit), ('托盘', CloseBehavior.hide)],
-        state.closeBehavior,
-        (v) => state.closeBehavior = v,
+        data.closeBehavior,
+        (v) => appState.closeBehavior = v,
       ),
     );
   }
 
-  Widget _censorModeRow(AppState state) {
+  Widget _censorModeRow(({bool showSettings, bool cookieStatus, UserInfo? userInfo, bool asrRestarting, String asrLang, bool noiseSuppress, CensorMode censorMode, CloseBehavior closeBehavior}) data, AppState appState) {
     return _settingsRow(
       '敏感词过滤',
       _toggleGroup<int>(
         [('关闭', 0), ('[***]', 1), ('首字母', 2)],
-        state.censorMode.index,
-        (v) => state.censorMode = CensorMode.values[v],
+        data.censorMode.index,
+        (v) => appState.censorMode = CensorMode.values[v],
       ),
     );
   }
 
-  Widget _languageRow(AppState state) {
+  Widget _languageRow(({bool showSettings, bool cookieStatus, UserInfo? userInfo, bool asrRestarting, String asrLang, bool noiseSuppress, CensorMode censorMode, CloseBehavior closeBehavior}) data, AppState appState) {
     return _settingsRow(
       '识别语言',
       _toggleGroup<String>(
         [('自动', 'auto'), ('中文', 'zh'), ('英文', 'en'), ('日语', 'ja')],
-        state.asrLang,
-        (v) => state.asrLang = v,
+        data.asrLang,
+        (v) => appState.asrLang = v,
       ),
     );
   }
 
-  Widget _noiseRow(BuildContext context, AppState state) {
+  Widget _noiseRow(({bool showSettings, bool cookieStatus, UserInfo? userInfo, bool asrRestarting, String asrLang, bool noiseSuppress, CensorMode censorMode, CloseBehavior closeBehavior}) data, AppState appState) {
     return Row(
       children: [
         Expanded(
@@ -215,8 +224,8 @@ class SettingsModal extends StatelessWidget {
               const Spacer(),
               _toggleGroup<bool>(
                 [('开', true), ('关', false)],
-                state.noiseSuppress,
-                (v) => state.noiseSuppress = v,
+                data.noiseSuppress,
+                (v) => appState.noiseSuppress = v,
               ),
             ],
           ),
@@ -232,8 +241,8 @@ class SettingsModal extends StatelessWidget {
               const Spacer(),
               _actionBtn(
                 '重启',
-                () => state.restartAsr(),
-                disabled: state.asrRestarting,
+                () => appState.restartAsr(),
+                disabled: data.asrRestarting,
               ),
             ],
           ),

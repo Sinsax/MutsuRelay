@@ -51,19 +51,45 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
 
   @override
   Widget build(BuildContext context) {
-    final isMini = context.watch<AppState>().windowMode == WindowMode.mini;
-    return Consumer<AppState>(
-      builder: (context, state, _) {
+    return Selector<AppState, ({WindowMode windowMode, bool invertMiniText, bool isConnected, bool cookieStatus, List<SentenceItem> sentenceList, String liveText, bool isRecording, int pendingCount, int? editingId, String editText, String manualInput})>(
+      selector: (_, state) => (
+        windowMode: state.windowMode,
+        invertMiniText: state.invertMiniText,
+        isConnected: state.isConnected,
+        cookieStatus: state.cookieStatus,
+        sentenceList: state.sentenceList,
+        liveText: state.liveText,
+        isRecording: state.isRecording,
+        pendingCount: state.pendingCount,
+        editingId: state.editingId,
+        editText: state.editText,
+        manualInput: state.manualInput,
+      ),
+      builder: (context, data, _) {
+        final state = context.read<AppState>();
         _syncEditController(state);
+        final isMini = data.windowMode == WindowMode.mini;
         if (isMini) {
-          return _miniLayout(state);
+          return _miniLayout(data);
         }
-        return _normalLayout(state);
+        return _normalLayout(data);
       },
     );
   }
 
-  Widget _normalLayout(AppState state) {
+  Widget _normalLayout((
+    {WindowMode windowMode,
+    bool invertMiniText,
+    bool isConnected,
+    bool cookieStatus,
+    List<SentenceItem> sentenceList,
+    String liveText,
+    bool isRecording,
+    int pendingCount,
+    int? editingId,
+    String editText,
+    String manualInput}
+  ) data) {
     return Container(
       decoration: BoxDecoration(
         color: const Color(0x80FFFFFF),
@@ -72,33 +98,59 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
       clipBehavior: Clip.antiAlias,
       child: Column(
         children: [
-          _header(state),
-          Expanded(child: _listBody(state, false)),
-          _manualInput(state, false),
+          _header(data, mini: false, invert: false),
+          Expanded(child: _listBody(data, false, invert: false)),
+          _manualInput(data, false, invert: false),
         ],
       ),
     );
   }
 
-  Widget _miniLayout(AppState state) {
-    final invert = state.invertMiniText;
+  Widget _miniLayout((
+    {WindowMode windowMode,
+    bool invertMiniText,
+    bool isConnected,
+    bool cookieStatus,
+    List<SentenceItem> sentenceList,
+    String liveText,
+    bool isRecording,
+    int pendingCount,
+    int? editingId,
+    String editText,
+    String manualInput}
+  ) data) {
+    final invert = data.invertMiniText;
     return Column(
       children: [
-        _header(state, mini: true, invert: invert),
-        Expanded(child: _listBody(state, true, invert: invert)),
-        _manualInput(state, true, invert: invert),
+        _header(data, mini: true, invert: invert),
+        Expanded(child: _listBody(data, true, invert: invert)),
+        _manualInput(data, true, invert: invert),
       ],
     );
   }
 
-  Widget _header(AppState state, {bool mini = false, bool invert = false}) {
+  Widget _header((
+    {WindowMode windowMode,
+    bool invertMiniText,
+    bool isConnected,
+    bool cookieStatus,
+    List<SentenceItem> sentenceList,
+    String liveText,
+    bool isRecording,
+    int pendingCount,
+    int? editingId,
+    String editText,
+    String manualInput}
+  ) data, {bool mini = false, bool invert = false}) {
+    final state = context.read<AppState>();
+    final isEmpty = data.sentenceList.isEmpty;
     return Container(
       padding: EdgeInsets.symmetric(horizontal: mini ? 10 : 12, vertical: mini ? 4 : 8),
       decoration: BoxDecoration(
-        color: const Color(0x66FFFFFF),
+        color: mini ? const Color(0x66FFFFFF) : (invert ? const Color(0x335BC0BE) : const Color(0x66FFFFFF)),
         border: Border(
           bottom: BorderSide(
-            color: mini ? const Color(0x265BC0BE) : AppColors.divider,
+            color: mini ? const Color(0x265BC0BE) : (invert ? const Color(0x4D5BC0BE) : AppColors.divider),
             width: 1,
           ),
         ),
@@ -107,10 +159,10 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
         children: [
           Expanded(
             child: Text(
-              '消息列表(${state.pendingCount}/${state.sentenceList.length})',
+              '消息列表(${data.pendingCount}/${data.sentenceList.length})',
               style: mini
                   ? AppTextStyles.listHeader.copyWith(fontSize: 11, color: invert ? AppColors.textDark : Colors.white, fontWeight: FontWeight.w600, shadows: invert ? const [Shadow(color: Color(0x60FFFFFF), blurRadius: 4, offset: Offset(0, 1))] : const [Shadow(color: Color(0x80000000), blurRadius: 4, offset: Offset(0, 1))])
-                  : AppTextStyles.listHeader,
+                  : (invert ? AppTextStyles.listHeader.copyWith(color: Colors.white) : AppTextStyles.listHeader),
               overflow: TextOverflow.ellipsis,
             ),
           ),
@@ -119,12 +171,12 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
             color: Colors.transparent,
             child: InkWell(
               borderRadius: BorderRadius.circular(AppRadius.small),
-              onTap: state.sentenceList.isEmpty ? null : () => state.clearList(),
+              onTap: isEmpty ? null : () => state.clearList(),
               child: Container(
                 padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
                 decoration: BoxDecoration(
                   border: Border.all(
-                    color: state.sentenceList.isEmpty
+                    color: isEmpty
                         ? const Color(0x4D5BC0BE).withValues(alpha: 0.3)
                         : const Color(0x4D5BC0BE),
                   ),
@@ -134,9 +186,9 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
                   '清空',
                   style: TextStyle(
                     fontSize: 10,
-                    color: state.sentenceList.isEmpty
+                    color: isEmpty
                         ? AppColors.textDim.withValues(alpha: 0.3)
-                        : (mini ? (invert ? AppColors.textDark : Colors.white) : AppColors.textMuted),
+                        : (mini ? (invert ? AppColors.textDark : Colors.white) : (invert ? Colors.white : AppColors.textMuted)),
                     fontWeight: mini ? FontWeight.w600 : FontWeight.normal,
                   ),
                 ),
@@ -148,8 +200,21 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
     );
   }
 
-  Widget _listBody(AppState state, bool mini, {bool invert = false}) {
-    final isEmpty = state.sentenceList.isEmpty && !(state.liveText.isNotEmpty && state.isRecording);
+  Widget _listBody((
+    {WindowMode windowMode,
+    bool invertMiniText,
+    bool isConnected,
+    bool cookieStatus,
+    List<SentenceItem> sentenceList,
+    String liveText,
+    bool isRecording,
+    int pendingCount,
+    int? editingId,
+    String editText,
+    String manualInput}
+  ) data, bool mini, {bool invert = false}) {
+    final hasLive = data.liveText.isNotEmpty && data.isRecording;
+    final isEmpty = data.sentenceList.isEmpty && !hasLive;
 
     if (isEmpty) {
       return Center(
@@ -173,19 +238,29 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
       );
     }
 
-    return Scrollbar(
-      controller: _scrollController,
-      thumbVisibility: true,
-      thickness: 4,
-      radius: const Radius.circular(2),
-      child: ListView(
+    return ScrollConfiguration(
+      behavior: ScrollConfiguration.of(context).copyWith(scrollbars: false),
+      child: Scrollbar(
         controller: _scrollController,
-        padding: EdgeInsets.all(mini ? 4 : 8),
-        children: [
-          if (state.liveText.isNotEmpty && state.isRecording)
-            _liveEntry(state.liveText, mini, invert: invert),
-          ...state.sentenceList.map((item) => _listItem(state, item, mini, invert: invert)),
-        ],
+        thumbVisibility: mini,
+        trackVisibility: mini,
+        thickness: 4,
+        radius: const Radius.circular(2),
+        child: ListView.builder(
+          controller: _scrollController,
+          padding: EdgeInsets.all(mini ? 4 : 8),
+          itemCount: (hasLive ? 1 : 0) + data.sentenceList.length,
+          itemBuilder: (context, index) {
+            if (hasLive && index == 0) {
+              return RepaintBoundary(
+                child: _liveEntry(data.liveText, mini, invert: invert),
+              );
+            }
+            final itemIndex = hasLive ? index - 1 : index;
+            final item = data.sentenceList[itemIndex];
+            return _listItem(data, item, mini, invert: invert, key: ValueKey(item.id));
+          },
+        ),
       ),
     );
   }
@@ -206,8 +281,21 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
     );
   }
 
-  Widget _listItem(AppState state, SentenceItem item, bool mini, {bool invert = false}) {
-    final isEditing = state.editingId == item.id;
+  Widget _listItem((
+    {WindowMode windowMode,
+    bool invertMiniText,
+    bool isConnected,
+    bool cookieStatus,
+    List<SentenceItem> sentenceList,
+    String liveText,
+    bool isRecording,
+    int pendingCount,
+    int? editingId,
+    String editText,
+    String manualInput}
+  ) data, SentenceItem item, bool mini, {bool invert = false, Key? key}) {
+    final state = context.read<AppState>();
+    final isEditing = data.editingId == item.id;
 
     Color borderColor;
     Color bgColor;
@@ -252,6 +340,7 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
           border: Border(left: BorderSide(color: borderColor, width: 3)),
         ),
         child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             _itemIcon(item.status, iconColor, mini),
             const SizedBox(width: 6),
@@ -292,6 +381,7 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
                     decoration: item.isSuccess ? TextDecoration.lineThrough : null,
                     shadows: mini ? (invert ? const [Shadow(color: Color(0x60FFFFFF), blurRadius: 4, offset: Offset(0, 1))] : const [Shadow(color: Color(0x80000000), blurRadius: 4, offset: Offset(0, 1))]) : null,
                   ),
+                  maxLines: 2,
                   overflow: TextOverflow.ellipsis,
                 ),
               ),
@@ -300,7 +390,7 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
               _actionBtn('发', () => state.sendItem(item.id),
                   mini ? (invert ? AppColors.textDark : Colors.white) : AppColors.textDark,
                   mini ? (invert ? AppColors.textDark : Colors.white) : AppColors.primary,
-                  item.isSending || !state.isConnected, mini),
+                  item.isSending || !data.isConnected, mini),
               _actionBtn('编', () => state.startEdit(item.id, item.text),
                   mini ? (invert ? AppColors.textDark : Colors.white) : AppColors.textSecondary,
                   mini ? (invert ? AppColors.textDark : Colors.white) : AppColors.primary, false, mini),
@@ -363,18 +453,31 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
     );
   }
 
-  Widget _manualInput(AppState state, bool mini, {bool invert = false}) {
-    final canSend = state.manualInput.trim().isNotEmpty &&
-        state.isConnected &&
-        state.cookieStatus;
+  Widget _manualInput((
+    {WindowMode windowMode,
+    bool invertMiniText,
+    bool isConnected,
+    bool cookieStatus,
+    List<SentenceItem> sentenceList,
+    String liveText,
+    bool isRecording,
+    int pendingCount,
+    int? editingId,
+    String editText,
+    String manualInput}
+  ) data, bool mini, {bool invert = false}) {
+    final state = context.read<AppState>();
+    final canSend = data.manualInput.trim().isNotEmpty &&
+        data.isConnected &&
+        data.cookieStatus;
 
     return Container(
       padding: EdgeInsets.all(mini ? 4 : 8),
       decoration: BoxDecoration(
-        color: mini ? Colors.transparent : const Color(0x66FFFFFF),
+        color: mini ? Colors.transparent : (invert ? const Color(0x335BC0BE) : const Color(0x66FFFFFF)),
         border: Border(
           top: BorderSide(
-            color: mini ? const Color(0x265BC0BE) : AppColors.divider,
+            color: mini ? const Color(0x265BC0BE) : (invert ? const Color(0x4D5BC0BE) : AppColors.divider),
             width: 1,
           ),
         ),
@@ -397,7 +500,7 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
                   decoration: InputDecoration(
                     hintText: '输入弹幕...',
                     hintStyle: TextStyle(
-                      color: mini ? (invert ? AppColors.textDark.withValues(alpha: 0.6) : Colors.white.withValues(alpha: 0.6)) : AppColors.textDim,
+                      color: mini ? (invert ? AppColors.textDark.withValues(alpha: 0.6) : Colors.white.withValues(alpha: 0.6)) : (invert ? Colors.white.withValues(alpha: 0.6) : AppColors.textDim),
                       fontSize: mini ? 11 : 12,
                       shadows: mini ? (invert ? [const Shadow(color: Color(0x60FFFFFF), blurRadius: 3, offset: Offset(0, 1))] : [const Shadow(color: Color(0x80000000), blurRadius: 3, offset: Offset(0, 1))]) : null,
                     ),
@@ -412,7 +515,7 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
                     enabledBorder: OutlineInputBorder(
                       borderRadius: BorderRadius.circular(mini ? 4 : AppRadius.card),
                       borderSide: BorderSide(
-                        color: state.isConnected && state.cookieStatus
+                        color: data.isConnected && data.cookieStatus
                             ? const Color(0x665BC0BE)
                             : const Color(0x665BC0BE).withValues(alpha: 0.4),
                       ),
@@ -422,7 +525,7 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
                       borderSide: const BorderSide(color: AppColors.primary, width: 1.5),
                     ),
                   ),
-                  enabled: state.isConnected && state.cookieStatus,
+                  enabled: data.isConnected && data.cookieStatus,
                 ),
               ),
             ),

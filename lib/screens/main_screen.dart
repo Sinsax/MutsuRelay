@@ -19,15 +19,21 @@ class MainScreen extends StatefulWidget {
 class _MainScreenState extends State<MainScreen> {
   @override
   Widget build(BuildContext context) {
-    return Consumer<AppState>(
-      builder: (context, state, _) {
+    return Selector<AppState, ({bool cookieStatus, bool isConnected, String roomId, WindowMode windowMode})>(
+      selector: (_, state) => (
+        cookieStatus: state.cookieStatus,
+        isConnected: state.isConnected,
+        roomId: state.roomId,
+        windowMode: state.windowMode,
+      ),
+      builder: (context, data, _) {
         return LayoutBuilder(
           builder: (context, constraints) {
             final showRight = constraints.maxWidth >= 400;
             return Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                _leftPanel(state),
+                _leftPanel(data),
                 const SizedBox(width: AppInsets.gap),
                 Expanded(
                   child: LayoutBuilder(
@@ -41,7 +47,7 @@ class _MainScreenState extends State<MainScreen> {
                 ),
                 if (showRight) ...[
                   const SizedBox(width: AppInsets.gap),
-                  _rightPanel(state),
+                  _rightPanel(data),
                 ],
               ],
             );
@@ -51,25 +57,17 @@ class _MainScreenState extends State<MainScreen> {
     );
   }
 
-  Widget _leftPanel(AppState state) {
+  Widget _leftPanel(({bool cookieStatus, bool isConnected, String roomId, WindowMode windowMode}) data) {
     return SizedBox(
       width: AppInsets.leftPanelW,
       child: SingleChildScrollView(
         child: ListBody(
           children: [
             const Center(child: MicButton()),
+            const SizedBox(height: 10),
+            _card(child: const ModeToggle()),
             const SizedBox(height: 6),
-            _card(
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  const ModeToggle(),
-                  const SizedBox(height: 8),
-                  const VadSlider(),
-                ],
-              ),
-            ),
+            _card(child: const VadSlider()),
           ],
         ),
       ),
@@ -89,30 +87,31 @@ class _MainScreenState extends State<MainScreen> {
     );
   }
 
-  Widget _rightPanel(AppState state) {
+  Widget _rightPanel(({bool cookieStatus, bool isConnected, String roomId, WindowMode windowMode}) data) {
+    final state = context.read<AppState>();
     return SizedBox(
       width: AppInsets.rightPanelW,
       child: Column(
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          if (!state.cookieStatus)
+          if (!data.cookieStatus)
             _dashedBtn('登录B站', Icons.qr_code, () => state.showQrLogin = true),
-          if (state.cookieStatus) ...[
+          if (data.cookieStatus) ...[
             _card(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
                   _solidBtn(
-                    label: state.isConnected ? '断开连接' : '连接直播间',
-                    isActive: state.isConnected,
+                    label: data.isConnected ? '断开连接' : '连接直播间',
+                    isActive: data.isConnected,
                     disabled: false,
-                    icon: state.isConnected
+                    icon: data.isConnected
                         ? Icons.link_off_rounded
                         : Icons.link_rounded,
                     onTap: () {
-                      if (state.isConnected) {
+                      if (data.isConnected) {
                         state.disconnectRoom();
                       } else {
                         final id = NativeBridge.instance.getMyRoomId();
@@ -124,9 +123,9 @@ class _MainScreenState extends State<MainScreen> {
                       }
                     },
                   ),
-                  if (state.isConnected) ...[
+                  if (data.isConnected) ...[
                     const SizedBox(height: 8),
-                    _roomLink(state.roomId),
+                    _roomLink(data.roomId),
                   ],
                 ],
               ),

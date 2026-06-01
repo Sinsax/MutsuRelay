@@ -55,7 +55,7 @@ class ModeToggle extends StatelessWidget {
         borderRadius: BorderRadius.circular(7),
         onTap: onTap,
         child: Padding(
-          padding: const EdgeInsets.symmetric(vertical: 10),
+          padding: const EdgeInsets.symmetric(vertical: 5),
           child: Center(
             child: Text(
               label,

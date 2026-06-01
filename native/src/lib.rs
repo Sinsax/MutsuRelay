@@ -5,20 +5,21 @@ pub mod vad;
 use std::ffi::{CStr, CString};
 use std::io::Read;
 use std::os::raw::c_char;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
-use vad::{resample_audio, rms, CONTEXT_SAMPLES, INTERIM_INTERVAL, MAX_SEGMENT_SAMPLES, VAD_FRAME_SAMPLES, VAD_MAX_SILENCE_FRAMES, VAD_MIN_SILENCE_FRAMES, VAD_MIN_SPEECH_FRAMES, VAD_HYSTERESIS};
+use vad::{resample_audio, rms, CONTEXT_SAMPLES, MAX_SEGMENT_SAMPLES, VAD_FRAME_SAMPLES, VAD_MAX_SILENCE_FRAMES, VAD_MIN_SILENCE_FRAMES, VAD_MIN_SPEECH_FRAMES, VAD_HYSTERESIS};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{StreamConfig, BufferSize};
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static IS_RECORDING: AtomicBool = AtomicBool::new(false);
+static IN_SPEECH: OnceLock<AtomicBool> = OnceLock::new();
 static NOISE_GATE: OnceLock<Mutex<f32>> = OnceLock::new();
 static CENSOR_MODE: OnceLock<Mutex<i32>> = OnceLock::new();
 static NOISE_SUPPRESS: OnceLock<AtomicBool> = OnceLock::new();
-static AUDIO_LEVEL: OnceLock<Mutex<f32>> = OnceLock::new();
+static AUDIO_LEVEL: OnceLock<AtomicU32> = OnceLock::new();
 static RECOGNITION_TEXT: OnceLock<Mutex<String>> = OnceLock::new();
 static MODEL_DIR: OnceLock<Mutex<String>> = OnceLock::new();
 static ASR_LANG: OnceLock<Mutex<String>> = OnceLock::new();
@@ -33,8 +34,11 @@ fn censor_mode() -> &'static Mutex<i32> {
 fn noise_suppress() -> &'static AtomicBool {
     NOISE_SUPPRESS.get_or_init(|| AtomicBool::new(true))
 }
-fn audio_level() -> &'static Mutex<f32> {
-    AUDIO_LEVEL.get_or_init(|| Mutex::new(0.0))
+fn in_speech_state() -> &'static AtomicBool {
+    IN_SPEECH.get_or_init(|| AtomicBool::new(false))
+}
+fn audio_level() -> &'static AtomicU32 {
+    AUDIO_LEVEL.get_or_init(|| AtomicU32::new(f32::to_bits(0.0)))
 }
 fn recognition_text() -> &'static Mutex<String> {
     RECOGNITION_TEXT.get_or_init(|| Mutex::new(String::new()))
@@ -50,6 +54,15 @@ fn last_output() -> &'static Mutex<(String, Instant)> {
 }
 
 const ASR_SAMPLE_RATE: u32 = 16000;
+const SEGMENT_ENERGY_FLOOR: f32 = 0.005;
+const BATCH_MAX_SIZE: usize = 2;
+const BATCH_TIMEOUT_MS: u64 = 120;
+
+struct PendingSegment {
+    context: Vec<f32>,
+    audio: Vec<f32>,
+    queued_at: Instant,
+}
 
 fn find_asr_model() -> Option<(String, String)> {
     let dir = model_dir().lock().ok()?.clone();
@@ -127,7 +140,7 @@ pub extern "C" fn mutsurelay_is_recording() -> i32 {
 
 #[no_mangle]
 pub extern "C" fn mutsurelay_get_audio_level() -> f64 {
-    audio_level().lock().map(|l| *l as f64).unwrap_or(0.0)
+    f32::from_bits(audio_level().load(Ordering::Relaxed)) as f64
 }
 
 #[no_mangle]
@@ -139,17 +152,42 @@ pub extern "C" fn mutsurelay_get_recognition_result() -> *mut c_char {
     CString::new(text).unwrap_or_default().into_raw()
 }
 
+#[no_mangle]
+pub extern "C" fn mutsurelay_poll_recording() -> *mut c_char {
+    let recording = IS_RECORDING.load(Ordering::SeqCst);
+    let level = f32::from_bits(audio_level().load(Ordering::Relaxed)) as f64;
+    let text: serde_json::Value = recognition_text()
+        .lock()
+        .map(|mut t| {
+            let s = std::mem::take(&mut *t);
+            if s.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::from_str(&s).unwrap_or(serde_json::Value::Null)
+            }
+        })
+        .unwrap_or(serde_json::Value::Null);
+    let in_speech = in_speech_state().load(Ordering::SeqCst);
+    let json = serde_json::json!({
+        "recording": recording,
+        "level": level,
+        "text": text,
+        "in_speech": in_speech,
+    });
+    CString::new(json.to_string()).unwrap_or_default().into_raw()
+}
+
 fn run_recording_pipeline() -> Option<()> {
-    println!("[rust] run_recording_pipeline: starting");
+    // println!("[rust] run_recording_pipeline: starting");
 
     let host = cpal::default_host();
-    println!("[rust] host: {:?}", host.id());
+    // println!("[rust] host: {:?}", host.id());
 
     let devices: Vec<_> = host.input_devices().ok()?.collect();
-    println!("[rust] input devices: {}", devices.len());
-    for d in &devices {
-        println!("[rust]   device: {:?}", d.name());
-    }
+    // println!("[rust] input devices: {}", devices.len());
+    // for d in &devices {
+    //     println!("[rust]   device: {:?}", d.name());
+    // }
 
     // Prefer microphone devices, then PulseAudio/PipeWire compat, then hardware ALSA
     let device = devices.iter().find(|d| {
@@ -164,20 +202,20 @@ fn run_recording_pipeline() -> Option<()> {
             nl == "pulse" || nl == "default" || nl.starts_with("sysdefault")
         }).unwrap_or(false))
     }).or_else(|| devices.iter().next())?.clone();
-    println!("[rust] selected device: {:?}", device.name());
+    // println!("[rust] selected device: {:?}", device.name());
 
     let config = device.default_input_config().ok()?;
     let channels = config.channels() as usize;
     let input_rate = config.sample_rate().0;
-    println!("[rust] default input config: {}ch, {}Hz", channels, input_rate);
+    // println!("[rust] default input config: {}ch, {}Hz", channels, input_rate);
 
     let stream_cfg = StreamConfig {
         channels: config.channels(),
         sample_rate: config.sample_rate(),
         buffer_size: BufferSize::Default,
     };
-    println!("[rust] stream config: {}ch, {}Hz, buffer={:?}",
-        stream_cfg.channels, stream_cfg.sample_rate.0, stream_cfg.buffer_size);
+    // println!("[rust] stream config: {}ch, {}Hz, buffer={:?}",
+    //     stream_cfg.channels, stream_cfg.sample_rate.0, stream_cfg.buffer_size);
 
     let (tx, rx) = std::sync::mpsc::channel::<Vec<f32>>();
 
@@ -189,46 +227,44 @@ fn run_recording_pipeline() -> Option<()> {
         |err| println!("[rust] Audio stream error: {err}"),
         None,
     );
-    println!("[rust] build_input_stream: {:?}", stream.is_ok());
+    // println!("[rust] build_input_stream: {:?}", stream.is_ok());
     let stream = stream.ok()?;
 
     let play_result = stream.play();
-    println!("[rust] stream.play(): {:?}", play_result);
+    // println!("[rust] stream.play(): {:?}", play_result);
     let _ = play_result;
 
     let mut ring_buf = Vec::with_capacity(CONTEXT_SAMPLES * 2);
     let mut seg_buf = Vec::with_capacity(MAX_SEGMENT_SAMPLES);
+    let mut frame_buf = Vec::with_capacity(VAD_FRAME_SAMPLES);
+    let mut denoised_buf = Vec::with_capacity(VAD_FRAME_SAMPLES);
+    let mut pending: Vec<PendingSegment> = Vec::with_capacity(BATCH_MAX_SIZE);
     let mut in_speech = false;
     let mut consecutive_speech: u32 = 0;
     let mut max_consecutive_speech: u32 = 0;
     let mut silence_frames: u32 = 0;
     let mut leftover = Vec::new();
-    let mut interim_frame: u32 = 0;
+    let mut _interim_frame: u32 = 0;
     let mut noise_raw: f32 = 0.01;
     let models = find_asr_model();
 
-    println!("[rust] models found: {:?}", models.is_some());
+    // println!("[rust] models found: {:?}", models.is_some());
 
-    let recognizer = models.as_ref().and_then(|(model_path, tokens_path)| {
-        let lang = asr_lang().lock().map(|l| l.clone()).unwrap_or_default();
-        println!("[rust] creating recognizer, lang={lang}, model={model_path}, tokens={tokens_path}");
-        let mut cfg = sherpa_onnx::OfflineRecognizerConfig::default();
-        cfg.model_config.sense_voice = sherpa_onnx::OfflineSenseVoiceModelConfig {
-            model: Some(model_path.clone()),
-            language: Some(if lang.is_empty() { "auto".to_string() } else { lang }),
-            use_itn: true,
-        };
-        cfg.model_config.tokens = Some(tokens_path.clone());
-        cfg.decoding_method = Some("greedy_search".to_string());
-        let r = sherpa_onnx::OfflineRecognizer::create(&cfg);
-        println!("[rust] recognizer created: {:?}", r.is_some());
-        r
-    });
+    let mut recognizer: Option<sherpa_onnx::OfflineRecognizer> = None;
 
-    let mut frame_count: u64 = 0;
-    println!("[rust] entering main loop (CONTEXT_SAMPLES={CONTEXT_SAMPLES})");
+    let mut _frame_count: u64 = 0;
+    // println!("[rust] entering main loop (CONTEXT_SAMPLES={CONTEXT_SAMPLES})");
     loop {
-        if !IS_RECORDING.load(Ordering::SeqCst) { println!("[rust] IS_RECORDING became false, exiting"); break; }
+        if !IS_RECORDING.load(Ordering::SeqCst) { /* println!("[rust] IS_RECORDING became false, exiting"); */ break; }
+
+        // Flush pending segments on timeout
+        if !pending.is_empty()
+            && pending[0].queued_at.elapsed().as_millis() >= BATCH_TIMEOUT_MS as u128
+        {
+            if let Some(ref r) = recognizer {
+                flush_pending_segments(r, &mut pending);
+            }
+        }
 
         let chunk: Vec<f32> = match rx.try_recv() {
             Ok(c) => c,
@@ -236,14 +272,10 @@ fn run_recording_pipeline() -> Option<()> {
                 thread::sleep(Duration::from_millis(10));
                 continue;
             }
-            Err(_) => { println!("[rust] channel disconnected, exiting"); break; }
+            Err(_) => { /* println!("[rust] channel disconnected, exiting"); */ break; }
         };
 
-        frame_count += 1;
-
-        // Peak for level meter (scale up for visibility)
-        let peak = chunk.iter().fold(0.0_f32, |acc, s| acc.max(s.abs()));
-        if let Ok(mut l) = audio_level().lock() { *l = (peak * 2.0).min(1.0); }
+        _frame_count += 1;
 
         // Convert stereo to mono
         let mono = if channels > 1 {
@@ -254,11 +286,13 @@ fn run_recording_pipeline() -> Option<()> {
             }
             m
         } else {
-            chunk.clone()
+            chunk
         };
 
         let resampled = resample_audio(&mono, input_rate, ASR_SAMPLE_RATE);
         if resampled.is_empty() { continue; }
+
+        let mut max_energy: f32 = 0.0;
 
         // Maintain ring buffer (only last CONTEXT_SAMPLES * 2)
         ring_buf.extend_from_slice(&resampled);
@@ -271,11 +305,12 @@ fn run_recording_pipeline() -> Option<()> {
         let threshold = noise_gate().lock().map(|g| *g).unwrap_or(0.01);
 
         while leftover.len() >= VAD_FRAME_SAMPLES {
-            let frame: Vec<f32> = leftover.drain(..VAD_FRAME_SAMPLES).collect();
-            let raw_energy = rms(&frame);
+            frame_buf.clear();
+            frame_buf.extend(leftover.drain(..VAD_FRAME_SAMPLES));
+            let raw_energy = rms(&frame_buf);
 
             // Adaptive noise floor (slower update during speech)
-            let noise_rate = if in_speech { 0.999 } else { 0.95 };
+            let noise_rate = if in_speech { 0.999 } else { 0.92 };
             noise_raw = noise_raw * noise_rate + raw_energy * (1.0 - noise_rate);
 
             // Denoising gain (matches Tauri)
@@ -284,14 +319,16 @@ fn run_recording_pipeline() -> Option<()> {
             let gain = if !suppress {
                 1.0
             } else if signal_ratio < 0.5 {
-                0.1 + signal_ratio * 0.3
+                0.3 + signal_ratio * 0.3
             } else if signal_ratio < 1.5 {
-                0.25 + (signal_ratio - 0.5) * 0.75
+                0.45 + (signal_ratio - 0.5) * 0.55
             } else {
                 1.0
             };
-            let denoised: Vec<f32> = frame.iter().map(|s| s * gain).collect();
-            let energy = rms(&denoised);
+            denoised_buf.clear();
+            denoised_buf.extend(frame_buf.iter().map(|s| s * gain));
+            let energy = rms(&denoised_buf);
+            max_energy = max_energy.max(energy);
 
             let audio_active = if in_speech {
                 energy >= threshold * VAD_HYSTERESIS
@@ -304,53 +341,107 @@ fn run_recording_pipeline() -> Option<()> {
                     in_speech = true;
                     consecutive_speech = 1;
                     max_consecutive_speech = max_consecutive_speech.max(consecutive_speech);
-                    interim_frame = 0;
+                    _interim_frame = 0;
                 } else {
                     consecutive_speech += 1;
                     max_consecutive_speech = max_consecutive_speech.max(consecutive_speech);
                 }
                 silence_frames = 0;
-                seg_buf.extend_from_slice(&denoised);
-                interim_frame += 1;
-                if interim_frame >= INTERIM_INTERVAL {
-                    interim_frame = 0;
-                    if let Some(ref r) = recognizer { process_segment(&ring_buf, &seg_buf, r, false); }
+                seg_buf.extend_from_slice(&denoised_buf);
+
+                if recognizer.is_none() && max_consecutive_speech >= VAD_MIN_SPEECH_FRAMES {
+                    recognizer = models.as_ref().and_then(|(model_path, tokens_path)| {
+                        let lang = asr_lang().lock().map(|l| l.clone()).unwrap_or_default();
+                        let mut cfg = sherpa_onnx::OfflineRecognizerConfig::default();
+                        cfg.model_config.sense_voice = sherpa_onnx::OfflineSenseVoiceModelConfig {
+                            model: Some(model_path.clone()),
+                            language: Some(if lang.is_empty() { "auto".to_string() } else { lang }),
+                            use_itn: true,
+                        };
+                        cfg.model_config.tokens = Some(tokens_path.clone());
+                        cfg.decoding_method = Some("greedy_search".to_string());
+                        sherpa_onnx::OfflineRecognizer::create(&cfg)
+                    });
                 }
+                // interim_frame += 1;
+                // if interim_frame >= INTERIM_INTERVAL {
+                //     interim_frame = 0;
+                //     if let Some(ref r) = recognizer { process_segment(&ring_buf, &seg_buf, r, false); }
+                // }
             } else if in_speech {
                 silence_frames += 1;
-                seg_buf.extend_from_slice(&denoised);
+                seg_buf.extend_from_slice(&denoised_buf);
                 max_consecutive_speech = max_consecutive_speech.max(consecutive_speech);
                 consecutive_speech = 0;
                 if silence_frames >= VAD_MIN_SILENCE_FRAMES {
                     let push_now = max_consecutive_speech >= VAD_MIN_SPEECH_FRAMES || silence_frames >= VAD_MAX_SILENCE_FRAMES;
                     if push_now {
                         if max_consecutive_speech >= VAD_MIN_SPEECH_FRAMES {
-                            if let Some(ref r) = recognizer { process_segment(&ring_buf, &seg_buf, r, true); }
+                            if rms(&seg_buf) >= SEGMENT_ENERGY_FLOOR {
+                                if recognizer.is_some() {
+                                    let ctx_start = ring_buf.len().saturating_sub(CONTEXT_SAMPLES);
+                                    pending.push(PendingSegment {
+                                        context: ring_buf[ctx_start..].to_vec(),
+                                        audio: seg_buf.clone(),
+                                        queued_at: Instant::now(),
+                                    });
+                                }
+                            }
                         }
                         seg_buf.clear();
-                        in_speech = false; consecutive_speech = 0; max_consecutive_speech = 0; silence_frames = 0; interim_frame = 0;
+                        in_speech = false; consecutive_speech = 0; max_consecutive_speech = 0; silence_frames = 0; _interim_frame = 0;
                     }
                 }
             }
 
             if seg_buf.len() >= MAX_SEGMENT_SAMPLES && in_speech {
                 if max_consecutive_speech >= VAD_MIN_SPEECH_FRAMES {
-                    if let Some(ref r) = recognizer { process_segment(&ring_buf, &seg_buf, r, true); }
+                    if rms(&seg_buf) >= SEGMENT_ENERGY_FLOOR {
+                        if recognizer.is_some() {
+                            let ctx_start = ring_buf.len().saturating_sub(CONTEXT_SAMPLES);
+                            pending.push(PendingSegment {
+                                context: ring_buf[ctx_start..].to_vec(),
+                                audio: seg_buf.clone(),
+                                queued_at: Instant::now(),
+                            });
+                        }
+                    }
                 }
                 seg_buf.clear();
-                in_speech = false; consecutive_speech = 0; max_consecutive_speech = 0; silence_frames = 0; interim_frame = 0;
-            }
+                in_speech = false; consecutive_speech = 0; max_consecutive_speech = 0; silence_frames = 0; _interim_frame = 0;
+        }
 
-            if frame_count % 100 == 0 {
-                println!("[rust] frame {}: in_speech={in_speech}, energy={energy:.4}, threshold={threshold:.4}, noise_floor={:.4}", frame_count, noise_raw * 1.5);
+        // Flush if batch is full
+        if pending.len() >= BATCH_MAX_SIZE {
+            if let Some(ref r) = recognizer {
+                flush_pending_segments(r, &mut pending);
             }
+        }
+
+        audio_level().store(f32::to_bits((max_energy * 10.0).min(1.0)), Ordering::Relaxed);
+        in_speech_state().store(in_speech, Ordering::Relaxed);
+
+        // if frame_count % 100 == 0 {
+        //     println!("[rust] frame {}: in_speech={in_speech}, energy={energy:.4}, threshold={threshold:.4}, noise_floor={:.4}", frame_count, noise_raw * 1.5);
+        // }
         }
     }
 
     max_consecutive_speech = max_consecutive_speech.max(consecutive_speech);
-    println!("[rust] loop exited, finalizing (in_speech={in_speech}, max_consecutive_speech={max_consecutive_speech})");
     if in_speech && max_consecutive_speech >= VAD_MIN_SPEECH_FRAMES {
-        if let Some(ref r) = recognizer { process_segment(&ring_buf, &seg_buf, r, true); }
+        if rms(&seg_buf) >= SEGMENT_ENERGY_FLOOR {
+            if recognizer.is_some() {
+                let ctx_start = ring_buf.len().saturating_sub(CONTEXT_SAMPLES);
+                pending.push(PendingSegment {
+                    context: ring_buf[ctx_start..].to_vec(),
+                    audio: seg_buf.clone(),
+                    queued_at: Instant::now(),
+                });
+            }
+        }
+    }
+    if let Some(ref r) = recognizer {
+        flush_pending_segments(r, &mut pending);
     }
     Some(())
 }
@@ -418,23 +509,10 @@ fn split_sentence(text: &str) -> Vec<String> {
     parts
 }
 
-fn process_segment(ring_buf: &[f32], seg_buf: &[f32], recognizer: &sherpa_onnx::OfflineRecognizer, is_final: bool) {
-    let tag = if is_final { "final" } else { "interim" };
-    let stream = recognizer.create_stream();
-
-    // Send only last CONTEXT_SAMPLES as context (matches Tauri)
-    let ctx_start = ring_buf.len().saturating_sub(CONTEXT_SAMPLES);
-    if ctx_start < ring_buf.len() {
-        stream.accept_waveform(ASR_SAMPLE_RATE as i32, &ring_buf[ctx_start..]);
-    }
-    stream.accept_waveform(ASR_SAMPLE_RATE as i32, seg_buf);
-
-    let mut s = stream; // rebind as mutable
-    recognizer.decode(&mut s);
-    let text = s.get_result().map(|r| r.text).unwrap_or_default();
+fn process_stream_result(stream: &sherpa_onnx::OfflineStream, is_final: bool) {
+    let text = stream.get_result().map(|r| r.text).unwrap_or_default();
     if text.trim().is_empty() { return; }
 
-    // Remove BPE token spaces between CJK characters (matches Tauri cleaning)
     let raw_chars: Vec<char> = text.chars().collect();
     let mut cleaned = String::with_capacity(text.len());
     for i in 0..raw_chars.len() {
@@ -446,7 +524,6 @@ fn process_segment(ring_buf: &[f32], seg_buf: &[f32], recognizer: &sherpa_onnx::
         }
         cleaned.push(raw_chars[i]);
     }
-    // Trim leading/trailing punctuation
     let final_text = cleaned.trim_matches(|c: char| {
         c == '，' || c == '。' || c == '、' || c == '！' || c == '？'
         || c == '：' || c == '；' || c == '…' || c == '—' || c == '·'
@@ -454,7 +531,6 @@ fn process_segment(ring_buf: &[f32], seg_buf: &[f32], recognizer: &sherpa_onnx::
     }).to_string();
     if final_text.is_empty() { return; }
 
-    // Quality filtering
     let chars_only: String = final_text.chars().filter(|c| {
         !c.is_ascii_punctuation() && !"。，！？；、：…—·".contains(*c)
     }).collect();
@@ -462,19 +538,11 @@ fn process_segment(ring_buf: &[f32], seg_buf: &[f32], recognizer: &sherpa_onnx::
         if chars_only.len() < 2 { return; }
         if is_repetitive(&chars_only) { return; }
     } else {
-        if chars_only.len() < 2 {
-            println!("[rust] recognition filtered (punct only): {final_text}");
-            return;
-        }
-        if is_repetitive(&final_text) {
-            println!("[rust] recognition filtered (repetitive): {final_text}");
-            return;
-        }
-        // Dedup: skip identical text within 3 seconds
+        if chars_only.len() < 2 { return; }
+        if is_repetitive(&final_text) { return; }
         {
             let mut last = last_output().lock().unwrap();
             if last.0 == final_text && last.1.elapsed().as_secs() < 3 {
-                println!("[rust] recognition dedup skipped: {final_text}");
                 return;
             }
             last.0 = final_text.clone();
@@ -487,17 +555,35 @@ fn process_segment(ring_buf: &[f32], seg_buf: &[f32], recognizer: &sherpa_onnx::
         if mode > 0 { censor::censor(&final_text, mode) } else { final_text.clone() }
     };
 
-    println!("[rust] recognition {tag}: {filtered}");
     if is_final {
         for sentence in split_sentence(&filtered) {
             bilive::write_subtitle_text(&sentence);
         }
     }
-    // Send result as JSON with full text (filtered, not split)
+    let tag = if is_final { "final" } else { "interim" };
     let json = serde_json::json!({"type": tag, "text": filtered}).to_string();
     if let Ok(mut r) = recognition_text().lock() {
         *r = json;
     }
+}
+
+fn flush_pending_segments(recognizer: &sherpa_onnx::OfflineRecognizer, pending: &mut Vec<PendingSegment>) {
+    if pending.is_empty() { return; }
+
+    let streams: Vec<_> = pending.iter().map(|seg| {
+        let stream = recognizer.create_stream();
+        stream.accept_waveform(ASR_SAMPLE_RATE as i32, &seg.context);
+        stream.accept_waveform(ASR_SAMPLE_RATE as i32, &seg.audio);
+        stream
+    }).collect();
+
+    let stream_refs: Vec<_> = streams.iter().collect();
+    recognizer.decode_multiple_streams(&stream_refs);
+
+    for stream in &streams {
+        process_stream_result(stream, true);
+    }
+    pending.clear();
 }
 
 // ---- Model download ----

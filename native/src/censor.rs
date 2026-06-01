@@ -1,7 +1,10 @@
 use pinyin::ToPinyin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
-static BLOCKLIST: Mutex<Vec<String>> = Mutex::new(Vec::new());
+fn blocklist() -> &'static Mutex<Arc<Vec<String>>> {
+    static BLOCKLIST: OnceLock<Mutex<Arc<Vec<String>>>> = OnceLock::new();
+    BLOCKLIST.get_or_init(|| Mutex::new(Arc::new(Vec::new())))
+}
 
 fn get_storage_path() -> std::path::PathBuf {
     super::bilive::get_storage_dir().join("blocklist.txt")
@@ -30,17 +33,37 @@ fn to_initials(word: &str) -> String {
         .collect()
 }
 
+fn to_full_pinyin(word: &str) -> String {
+    word.to_pinyin()
+        .filter_map(|p| p.map(|py| py.plain().to_string()))
+        .collect()
+}
+
+fn is_full_coverage(spans: &[(usize, usize)], n: usize) -> bool {
+    if spans.is_empty() {
+        return false;
+    }
+    let mut covered = 0usize;
+    for &(s, e) in spans {
+        if s > covered {
+            return false;
+        }
+        covered = covered.max(e);
+    }
+    covered == n
+}
+
 pub fn censor(text: &str, mode: i32) -> String {
     if mode == 0 {
         return text.to_string();
     }
 
     // lazy init: ensure blocklist is loaded (copies from bundled if needed)
-    if BLOCKLIST.lock().map(|w| w.is_empty()).unwrap_or(true) {
+    if blocklist().lock().map(|w| w.is_empty()).unwrap_or(true) {
         reload_blocklist();
     }
 
-    let words = BLOCKLIST.lock().map(|w| w.clone()).unwrap_or_default();
+    let words = blocklist().lock().unwrap().clone();
     if words.is_empty() {
         return text.to_string();
     }
@@ -53,7 +76,7 @@ pub fn censor(text: &str, mode: i32) -> String {
 
     // Phase 1: find all match positions (start, end) for all words
     let mut matches: Vec<(usize, usize)> = Vec::new();
-    for word in &words {
+    for word in words.iter() {
         if word.is_empty() {
             continue;
         }
@@ -85,6 +108,11 @@ pub fn censor(text: &str, mode: i32) -> String {
         } else {
             spans.push((s, e));
         }
+    }
+
+    // Phase 2.5: if mode is pinyin initials, entire text is a single 2-char blocked word → full pinyin
+    if mode == 2 && n == 2 && is_full_coverage(&spans, n) {
+        return to_full_pinyin(text);
     }
 
     // Phase 3: build result, replacing each span
@@ -129,8 +157,8 @@ pub fn reload_blocklist() {
     loaded.sort_by(|a, b| b.len().cmp(&a.len()));
     loaded.dedup();
 
-    if let Ok(mut w) = BLOCKLIST.lock() {
-        *w = loaded;
+    if let Ok(mut w) = blocklist().lock() {
+        *w = Arc::new(loaded);
     }
     log::info!("Blocklist reloaded");
 }
@@ -140,8 +168,8 @@ mod tests {
     use super::*;
 
     fn setup(words: Vec<&str>) {
-        if let Ok(mut w) = BLOCKLIST.lock() {
-            *w = words.iter().map(|s| s.to_string()).collect();
+        if let Ok(mut w) = blocklist().lock() {
+            *w = Arc::new(words.iter().map(|s| s.to_string()).collect());
         }
     }
 
@@ -184,5 +212,29 @@ mod tests {
     fn test_multi_overlap() {
         setup(vec!["操你妈", "你妈逼"]);
         assert_eq!(censor("操你妈逼", 2), "cnmb");
+    }
+
+    #[test]
+    fn test_full_pinyin_two_char() {
+        setup(vec!["弱智"]);
+        assert_eq!(censor("弱智", 2), "ruozhi");
+    }
+
+    #[test]
+    fn test_full_pinyin_two_char_asterisk() {
+        setup(vec!["傻逼"]);
+        assert_eq!(censor("傻逼", 1), "[***]");
+    }
+
+    #[test]
+    fn test_initials_three_char() {
+        setup(vec!["操你妈"]);
+        assert_eq!(censor("操你妈", 2), "cnm");
+    }
+
+    #[test]
+    fn test_partial_full_pinyin_not_full_coverage() {
+        setup(vec!["废物"]);
+        assert_eq!(censor("你个废物", 2), "你个fw");
     }
 }

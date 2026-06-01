@@ -2,12 +2,12 @@
 pub const ASR_SAMPLE_RATE: u32 = 16000;
 pub const VAD_FRAME_MS: u32 = 30;
 pub const VAD_FRAME_SAMPLES: usize = (ASR_SAMPLE_RATE as usize) * VAD_FRAME_MS as usize / 1000;
-pub const VAD_HYSTERESIS: f32 = 0.7;
-pub const VAD_MIN_SILENCE_FRAMES: u32 = 20;
-pub const VAD_MAX_SILENCE_FRAMES: u32 = 60;
+pub const VAD_HYSTERESIS: f32 = 0.5;
+pub const VAD_MIN_SILENCE_FRAMES: u32 = 15;
+pub const VAD_MAX_SILENCE_FRAMES: u32 = 80;
 pub const VAD_MIN_SPEECH_FRAMES: u32 = 3;
-pub const CONTEXT_SAMPLES: usize = ASR_SAMPLE_RATE as usize * 300 / 1000; // 300ms context
-pub const MAX_SEGMENT_SAMPLES: usize = ASR_SAMPLE_RATE as usize * 60;
+pub const CONTEXT_SAMPLES: usize = ASR_SAMPLE_RATE as usize * 150 / 1000; // 150ms context
+pub const MAX_SEGMENT_SAMPLES: usize = ASR_SAMPLE_RATE as usize * 30;
 pub const INTERIM_INTERVAL: u32 = 15;
 
 /// Compute RMS energy of an audio frame

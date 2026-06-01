@@ -63,9 +63,10 @@ class _MutsuRelayHomeState extends State<MutsuRelayHome> with WindowListener {
 
   @override
   Widget build(BuildContext context) {
-    return Consumer<AppState>(
-      builder: (context, state, _) {
-        final isMini = state.windowMode == WindowMode.mini;
+    return Selector<AppState, WindowMode>(
+      selector: (_, state) => state.windowMode,
+      builder: (context, windowMode, _) {
+        final isMini = windowMode == WindowMode.mini;
         return Material(
           color: Colors.transparent,
           child: Stack(
