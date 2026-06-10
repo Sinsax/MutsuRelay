@@ -128,7 +128,7 @@ Compress-Archive -Path "build\windows\x64\runner\Release\*" -DestinationPath "di
 dart run fastforge:main package --platform linux --targets appimage
 ```
 
-CI 会在每次推送时自动执行完整构建+打包流程，产物可在 Action 页面下载。
+CI 默认禁用（`.github/workflows/build.yml.disabled`），重命名为 `build.yml` 可启用自动构建+打包。
 
 ## 使用
 

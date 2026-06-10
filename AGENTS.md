@@ -4,17 +4,21 @@
 
 ```sh
 fvm flutter analyze                    # gate before commit
+fvm flutter test                       # widget test (single)
 fvm flutter run -d linux               # builds Rust + bundles deps via CMake
 fvm flutter run -d windows             # same on Windows
 fvm dart run tool/build_and_run.dart    # fastest dev loop: Rust build + flutter run, skips cmake
 fvm dart run tool/package.dart          # builds release + AppImage + tar.gz (Linux) or Inno Setup + ZIP (Windows)
 native/build.sh                        # cargo build + copy .so to linux/mutsurelay_native
 native/build.ps1                       # same for .dll → windows/mutsurelay_native
+cargo test                             # 13 Rust unit tests (censor.rs, vad.rs)
+cargo check                            # fast Rust compile check (no codegen)
 fvm flutter clean                      # fix stale C++ build cache after Dart-only changes
 ```
 
 - FVM auto-detected on Linux (`fvm` on PATH → `fvm flutter`); Windows always uses plain `flutter`.
-- CI (`.github/workflows/build.yml`): analyze → build-windows + build-linux (sequential deps, not parallel).
+- CI (`.github/workflows/build.yml.disabled`): rename to `build.yml` to enable. Jobs: analyze → build-windows + build-linux (sequential deps, not parallel).
+- Version single source of truth: `version:` in `pubspec.yaml`.
 
 ## Architecture
 
@@ -24,7 +28,7 @@ fvm flutter clean                      # fix stale C++ build cache after Dart-on
 | State | `lib/providers/app_state.dart` | Single `ChangeNotifier` via provider, all getters/setters |
 | FFI | `lib/ffi/native_bridge.dart` | 30+ C functions via dart:ffi, auto-degrades to mock when lib absent |
 | UI | `lib/widgets/settings_modal.dart` | 250px `Stack` overlay (not a dialog), config dir open via `xdg-open`/`open`/`explorer` |
-| Rust cdylib | `native/src/lib.rs` | Recording pipeline, C API (719 lines), config persistence, ASR init |
+| Rust cdylib | `native/src/lib.rs` | Recording pipeline, C API (811 lines), config persistence, ASR init |
 | Bilibili | `native/src/bilive.rs` | QR login, cookie, room connection, subtitle write |
 | VAD/ASR | `native/src/lib.rs` + `vad.rs` | cpal mic capture + sherpa-onnx SenseVoice |
 
