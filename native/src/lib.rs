@@ -147,11 +147,28 @@ static RELOAD_GEN: AtomicU64 = AtomicU64::new(0);
 
 /// 让解码线程用当前模型目录 / 语言重建（或首次创建）recognizer。
 /// 线程常驻，所以"重建"发生在后台，界面不会卡；空闲时即等于预热。
+///
+/// 目标已经装好、或同一目标已在路上时 `AsrEngine::reload` 会返回 `false`，
+/// 此时**不推进 `RELOAD_GEN`**：否则"保存设置"这种高频路径会把空闲卸载的
+/// 判定一直顶掉（卸载线程靠代际变化判断"这段时间有没有人动过 ASR"）。
 fn trigger_reload() {
-    RELOAD_GEN.fetch_add(1, Ordering::SeqCst);
     let dir = model_dir().lock().map(|d| d.clone()).unwrap_or_default();
     let lang = asr_lang().lock().map(|l| l.clone()).unwrap_or_default();
-    engine().reload(dir, lang);
+    if engine().reload(dir, lang) {
+        RELOAD_GEN.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// 与 [`trigger_reload`] 相同，但跳过"已经装好就是这个目标"的短路。
+///
+/// 只给"模型文件可能已经变了 / 用户明确要求重来"的路径用（下载完模型、
+/// 界面上点"重启 ASR"）。这些场合必须真的重新加载一遍。
+fn trigger_reload_forced() {
+    let dir = model_dir().lock().map(|d| d.clone()).unwrap_or_default();
+    let lang = asr_lang().lock().map(|l| l.clone()).unwrap_or_default();
+    if engine().reload_forced(dir, lang) {
+        RELOAD_GEN.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 // ---------------------------------------------------------------- 采集会话
@@ -483,22 +500,25 @@ pub extern "C" fn mutsurelay_init(model_dir_ptr: *const c_char) -> i32 {
         env_logger::Env::default().default_filter_or("info"),
     )
     .try_init();
-    _init_internal(model_dir_ptr)
+    _init_internal(model_dir_ptr, false)
 }
 
-/// 重新初始化 ASR（换模型 / 换语言）。现在会**真正重建** recognizer。
+/// 启动路径：同步模型目录 / 语言 / 配置，并让 recognizer 就位。
+///
+/// 不强制重建：应用启动时会连着来两次（先是 init_asr，随后 loadSettings →
+/// `mutsurelay_load_config`），目标一样就没必要把 229 MB 模型装两遍。
 #[no_mangle]
 pub extern "C" fn mutsurelay_init_asr(model_dir_ptr: *const c_char) -> i32 {
-    _init_internal(model_dir_ptr)
+    _init_internal(model_dir_ptr, false)
 }
 
-/// 与 `mutsurelay_init_asr` 等价，语义更明确的别名。
+/// 界面上"重启 ASR"按钮：用户明确要求重来，**强制重建**。
 #[no_mangle]
 pub extern "C" fn mutsurelay_reload_asr(model_dir_ptr: *const c_char) -> i32 {
-    _init_internal(model_dir_ptr)
+    _init_internal(model_dir_ptr, true)
 }
 
-fn _init_internal(model_dir_ptr: *const c_char) -> i32 {
+fn _init_internal(model_dir_ptr: *const c_char, forced: bool) -> i32 {
     let dir = if model_dir_ptr.is_null() {
         String::new()
     } else {
@@ -525,7 +545,11 @@ fn _init_internal(model_dir_ptr: *const c_char) -> i32 {
     }
     // 解码线程常驻：这里只是让它换/建 recognizer。放在后台线程里做，
     // 240 MB 的加载不再砸在首句语音上，也不会卡住调用方。
-    trigger_reload();
+    if forced {
+        trigger_reload_forced();
+    } else {
+        trigger_reload();
+    }
     INITIALIZED.store(true, Ordering::SeqCst);
     0
 }
@@ -643,6 +667,10 @@ fn stats_json() -> serde_json::Value {
         "dropped_results": q.dropped(),
         "interim_runs": s.interim_runs.load(Ordering::Relaxed),
         "interim_results": s.interim_results.load(Ordering::Relaxed),
+        // 重建次数的可观测性：`set_asr_lang` 被高频调用时，这里应当**不涨**。
+        // 涨了就说明去重失效，用户会立刻感受到 CPU 与出字延迟的退化。
+        "asr_reloads": s.asr_reloads.load(Ordering::Relaxed),
+        "asr_reload_skipped": s.asr_reload_skipped.load(Ordering::Relaxed),
         "asr_state": asr::load_state(),
         "sessions": s.sessions.load(Ordering::Relaxed),
         "queue_depth": q.len(),
@@ -734,8 +762,9 @@ pub extern "C" fn mutsurelay_download_asr_model(
     let has_model = dir_path.join("model.int8.onnx").exists();
     let has_tokens = dir_path.join("tokens.txt").exists();
     log::info!("Extracted to {dir_s}, model={has_model} tokens={has_tokens}");
-    // 新模型就位后让解码线程换上去
-    trigger_reload();
+    // 新模型就位后让解码线程换上去。这里是**强制**重建：模型文件已经变了，
+    // "目标没变就跳过"的短路在这是错的（目录没变，文件变了）。
+    trigger_reload_forced();
     0
 }
 
@@ -888,8 +917,20 @@ pub extern "C" fn mutsurelay_set_asr_lang(lang: *const c_char) {
     } else {
         unsafe { CStr::from_ptr(lang) }.to_string_lossy().to_string()
     };
-    if let Ok(mut a) = asr_lang().lock() {
-        *a = l.clone();
+    let changed = match asr_lang().lock() {
+        Ok(mut a) => {
+            let changed = *a != l;
+            *a = l.clone();
+            changed
+        }
+        // 拿不到锁就当作变了：宁可多重建一次，也不要让语言切换静默失效
+        Err(_) => true,
+    };
+    // **语言没变就不要重建**。这是"保存设置"路径上的高频调用（界面每次调参都会
+    // 走一遍），而一次重建 = 229 MB 模型重新加载约 1.4 s，期间解码线程停摆、
+    // 待解码的段按容量丢最旧 —— 症状是"只调了下灵敏度，CPU 10%+，说话还不出字"。
+    if !changed {
+        return;
     }
     // 语言是 recognizer 的构造参数，改了必须重建才生效
     bilive::set_language(&l);

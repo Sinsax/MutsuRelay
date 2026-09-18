@@ -14,7 +14,7 @@
 //!    的尾巴（同一段音频出现在两段里），段上用 `seam_overlap_ms` 标出重叠时长，
 //!    交给文本层去重。
 
-use crate::audio::{peak, rms, ASR_SAMPLE_RATE};
+use crate::audio::{rms, ASR_SAMPLE_RATE};
 
 pub const VAD_FRAME_MS: u32 = 30;
 pub const VAD_FRAME_SAMPLES: usize = ASR_SAMPLE_RATE as usize * VAD_FRAME_MS as usize / 1000;
@@ -169,8 +169,8 @@ pub struct Segmenter {
     gain: f32,
     next_id: u64,
     processed_samples: u64,
-    /// 电平表弹道值（原始峰值）
-    meter_peak: f32,
+    /// 电平表弹道值（**原始 RMS**，与噪声门同一口径）
+    meter: f32,
 }
 
 impl Segmenter {
@@ -196,7 +196,7 @@ impl Segmenter {
             gain: 1.0,
             next_id: 0,
             processed_samples: 0,
-            meter_peak: 0.0,
+            meter: 0.0,
         }
     }
 
@@ -212,9 +212,14 @@ impl Segmenter {
         self.in_speech
     }
 
-    /// 电平表数值（0~1）
+    /// 电平表数值（0~1）。
+    ///
+    /// **必须与判决同一口径**（原始 RMS × 10），界面上的门限标线也是按
+    /// `gate * 10` 画的。此前这里用的是**峰值** × 10，而判决用的是 RMS 比门限：
+    /// 同一段话的峰值通常比 RMS 高 3~4 倍，于是"电平条明显越过门线、却一个字都不出"，
+    /// 用户看到的就是完全不符合直觉的静默。
     pub fn level(&self) -> f32 {
-        (self.meter_peak * 10.0).min(1.0)
+        (self.meter * 10.0).min(1.0)
     }
 
     pub fn noise_floor(&self) -> f32 {
@@ -282,7 +287,7 @@ impl Segmenter {
         self.pre_roll_filled = 0;
         self.pre_roll.iter_mut().for_each(|v| *v = 0.0);
         self.processed_samples = 0;
-        self.meter_peak = 0.0;
+        self.meter = 0.0;
     }
 
     fn push_pre_roll(&mut self, gated: &[f32]) {
@@ -481,8 +486,8 @@ impl Segmenter {
         }
         self.push_pre_roll(gated);
         self.processed_samples += frame.len() as u64;
-        // 电平表：取原始峰值，带衰减弹道
-        self.meter_peak = (self.meter_peak * 0.85).max(peak(frame));
+        // 电平表：与噪声门同一口径（原始 RMS），快启慢落
+        self.meter = (self.meter * 0.85).max(raw_energy);
 
         FrameOutcome {
             in_speech: self.in_speech,
@@ -513,6 +518,7 @@ impl Segmenter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::audio::peak;
 
     /// 静音底噪
     const SILENCE: f32 = 0.001;
@@ -842,5 +848,38 @@ mod tests {
         assert!(loud > 0.4, "响帧电平 {loud}");
         assert!(after < loud, "电平应衰减：{loud} → {after}");
         assert!(after > 0.0, "不应瞬间归零");
+    }
+
+    /// 回归：电平表必须与噪声门**同一口径**（原始 RMS）。
+    ///
+    /// 旧实现电平 = 峰值 × 10、判决 = RMS vs gate。同一个尖峰，峰值比 RMS 高一个
+    /// 数量级，于是电平条打满、门线还稳稳在下面，却一个字都不出 —— 用户的原话是
+    /// "明明音量电平对比这么大为什么没有输出"。
+    #[test]
+    fn meter_uses_the_same_energy_domain_as_gate() {
+        let mut c = cfg();
+        c.gate = 0.05;
+        let mut s = Segmenter::new(c);
+        let mut out = Vec::new();
+        // 稀疏尖峰帧：峰值 0.5、RMS≈0.046（低于门限），正是"电平看着很满但不触发"的音频
+        let mut f = vec![0.0f32; VAD_FRAME_SAMPLES];
+        for x in f.iter_mut().take(4) {
+            *x = 0.5;
+        }
+        let o = s.push_frame(&f, &mut out);
+        assert!(!o.in_speech, "RMS 低于门限就不该进入语音态");
+
+        let level = s.level();
+        assert!(
+            (level - 0.456).abs() < 0.01,
+            "电平应是 rms*10≈0.46，实际 {level}"
+        );
+        assert!(
+            level < c.gate * 10.0,
+            "电平 {level} 应低于门线 {}：与'没出字'的结论一致",
+            c.gate * 10.0
+        );
+        // 旧口径（峰值×10）会把这个电平顶到 1.0，远在门线之上 —— 那正是困惑的来源
+        assert!((peak(&f) * 10.0).min(1.0) > c.gate * 10.0);
     }
 }

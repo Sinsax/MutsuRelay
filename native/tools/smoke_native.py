@@ -1,14 +1,17 @@
 #!/usr/bin/env python
-"""native 库运行时冒烟测试（Windows / 无 Flutter 环境下的回归手段）。
+"""native 库运行时冒烟测试（不依赖 Flutter 的回归手段）。
 
-本机 Windows 侧没有可用的 Flutter SDK，`flutter analyze` 与真机运行都跑不了。
-这个脚本用 ctypes 直接加载 mutsurelay_native.dll，把 C API 全链路跑一遍，
-用来回答"改完还能不能用"这个问题：
+这是改完 native 后最快的端到端手段：用 ctypes 直接加载 mutsurelay_native.dll，
+把 C API 全链路跑一遍，用来回答"改完还能不能用"：
 
   1. DLL 与全部运行库依赖能否加载
   2. Dart 绑定的每个符号是否都能解析
   3. init / poll / censor / 噪声门 / 语言 / 配置 的基本行为
   4. 录音链路真的能起停，音频真的流进来了（stats.captured_chunks > 0）
+  5. 重建去重：调参不得触发 recognizer 重建风暴（见 [6c]）
+
+（Flutter 侧另有 `flutter analyze` / `flutter test` 可用，本脚本不替代它们，
+只覆盖 Dart 侧测不到的 native 运行时行为。）
 
 用法：
     python native/tools/smoke_native.py                     # 自动找 target/debug
@@ -200,6 +203,7 @@ def main():
     set_sub = bind("mutsurelay_set_subtitle_file_path", None, c_char_p)
     get_sub = bind("mutsurelay_get_subtitle_file_path", c_void_p)
     load_cfg = bind("mutsurelay_load_config", c_int)
+    save_cfg = bind("mutsurelay_save_config", c_int)
     get_cfg_dir = bind("mutsurelay_get_config_dir_path", c_void_p)
     get_last_err = bind("mutsurelay_get_last_error", c_void_p)
     # P2/P3 新增
@@ -282,6 +286,7 @@ def main():
                 "rejected_segments", "rejected_text", "seam_trimmed",
                 "decoded", "results", "dropped_results",
                 "interim_runs", "interim_results", "asr_state", "sessions",
+                "asr_reloads", "asr_reload_skipped",
                 "queue_depth", "seg_queue_depth", "seg_queue_max",
                 "decode_avg_ms", "decode_p50_ms", "decode_p95_ms", "decode_max_ms",
                 "frontend_avg_ms", "frontend_p95_ms", "frontend_max_ms",
@@ -374,6 +379,75 @@ def main():
             warn("asr_state = 加载失败", "模型文件缺失？")
         else:
             bad("asr_state 未在 60s 内就绪", f"state={st_val}")
+
+    # --- 6c. 重建去重：调参不得触发 recognizer 重建风暴 ---
+    #
+    # 真机反馈：只拖了一下灵敏度滑块，CPU 就 10%+，日志里 10 s 内出现 8 次
+    # "ASR reloaded (1412..1487ms)"，之后说话又慢又不出字。
+    # 链路是：滑块 onChanged → 保存设置 → set_asr_lang → 无条件重建 recognizer。
+    # 一次重建 = 229 MB 模型重新加载约 1.4 s，期间解码线程完全停摆、
+    # 段队列按容量丢最旧。这里把这条链路钉成回归测试。
+    print("\n[6c] 重建去重（灵敏度拖动回归）")
+    if set_lang and asr_state:
+
+        def wait_ready(timeout=60.0):
+            dl = time.time() + timeout
+            while time.time() < dl and asr_state() == 0:
+                time.sleep(0.25)
+            return asr_state()
+
+        # 让内存与配置文件一致：后面那些"同值设置"才是真正的 no-op
+        lang_now = take(get_lang()) or "zh"
+        set_lang(lang_now.encode("utf-8"))
+        if save_cfg:
+            save_cfg()
+        wait_ready()
+        base = jstats() or {}
+        r0 = base.get("asr_reloads", 0)
+        s0 = base.get("asr_reload_skipped", 0)
+
+        # A) 语言没变：连调 30 次（拖动滑块的真实形状）不得触发任何重建
+        for i in range(30):
+            set_gate(0.001 * (1 + i % 50))
+            set_lang(lang_now.encode("utf-8"))
+        time.sleep(0.8)
+        dr = (jstats() or {}).get("asr_reloads", 0) - r0
+        if dr == 0:
+            ok("语言未变时 30 次设置不触发重建", "reloads +0")
+        else:
+            bad("语言未变时 30 次设置不触发重建", f"reloads +{dr}（期望 0）")
+
+        # B) 目标已经装好：应用启动时 init_asr 之后紧接着 loadSettings→load_config
+        #    会再请求一次**完全相同**的目标，不该把 229 MB 模型装第二遍
+        init_asr(model_dir.encode("utf-8"))
+        load_cfg()
+        time.sleep(0.8)
+        dr = (jstats() or {}).get("asr_reloads", 0) - r0
+        if dr == 0:
+            ok("已装载的同目标请求被短路", "init_asr + load_config 未重复加载")
+        else:
+            bad("已装载的同目标请求被短路", f"reloads +{dr}（期望 0）")
+
+        # C) 语言真的变了：只应重建一次
+        set_gate(0.02)
+        other = "en" if lang_now != "en" else "zh"
+        set_lang(other.encode("utf-8"))
+        for _ in range(10):
+            set_lang(other.encode("utf-8"))
+        time.sleep(2.5)
+        st2 = jstats() or {}
+        dr = st2.get("asr_reloads", 0) - r0
+        ds = st2.get("asr_reload_skipped", 0) - s0
+        if dr == 1:
+            ok("换语言只重建一次", f"reloads +{dr} skipped +{ds}")
+        else:
+            bad("换语言只重建一次", f"reloads +{dr}（期望 1）")
+
+        # 还原成配置里的语言，避免影响后面的录音段
+        set_lang(lang_now.encode("utf-8"))
+        if save_cfg:
+            save_cfg()
+        (ok if wait_ready() == 1 else bad)("还原语言后 ASR 就绪", f"state={asr_state()}")
 
     # --- 7. 配置读取 ---
     print("\n[7] 配置持久化")

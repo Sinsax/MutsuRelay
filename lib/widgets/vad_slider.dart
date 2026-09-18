@@ -33,8 +33,10 @@ class VadSlider extends StatelessWidget {
                 value: state.noiseGateDisplay.toDouble(),
                 onChanged: (v) {
                   state.setNoiseGateFromSlider(v.round());
-
                 },
+                // 松手才持久化：拖动过程只更新运行时门限（native 侧是几个原子量），
+                // 不写盘、不触发 ASR 重建。
+                onChangeEnd: (_) => state.saveSettings(),
               ),
             ),
             Text(state.noiseGateHint, style: AppTextStyles.micLabel),

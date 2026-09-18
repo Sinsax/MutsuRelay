@@ -218,7 +218,9 @@ class AppState extends ChangeNotifier {
     _noiseGateDisplay = val;
     _noiseGate = 0.001 * val;
     NativeBridge.instance.setNoiseGate(_noiseGate);
-    saveSettings();
+    // 这里**不写配置**：滑块每一次 onChanged 都写盘 + 走一遍 saveSettings，
+    // 而 saveSettings 会调 setAsrLang —— native 侧一次语言变更 = 重新加载
+    // 229 MB 模型（约 1.4 s），拖动一次就是几十次重建。持久化交给 onChangeEnd。
     notifyListeners();
   }
 
@@ -746,6 +748,9 @@ class AppState extends ChangeNotifier {
   void saveSettings() {
     final bridge = NativeBridge.instance;
     bridge.setRoomId(int.tryParse(_roomId) ?? 0);
+    // **前提**：native 侧 `mutsurelay_set_asr_lang` 对"语言没变"是幂等的，不会重建
+    // recognizer。这条幂等性是刚需 —— 本方法被多处高频调用，一旦每次重建就是
+    // 229 MB 模型重载 + 解码线程停摆。改 native 那段前先确认这个前提还成立。
     bridge.setAsrLang(_asrLang);
     bridge.setCloseBehavior(_closeBehavior.name);
     bridge.setSubtitleFilePath(_subtitleFilePath);

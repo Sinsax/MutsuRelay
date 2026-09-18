@@ -126,6 +126,10 @@ pub struct Stats {
     pub interim_runs: AtomicU64,
     /// interim 结果投递条数（不写字幕、不发言，只给界面预览）
     pub interim_results: AtomicU64,
+    /// recognizer **真正**被重建的次数（去重之后实际落地的次数）
+    pub asr_reloads: AtomicU64,
+    /// 被去重跳过的重建请求数（同一目标已经在路上）
+    pub asr_reload_skipped: AtomicU64,
     /// 段队列当前深度 / 历史最大深度
     pub seg_queue_depth: AtomicU64,
     pub seg_queue_max: AtomicU64,
@@ -151,6 +155,8 @@ impl Default for Stats {
             results: AtomicU64::new(0),
             interim_runs: AtomicU64::new(0),
             interim_results: AtomicU64::new(0),
+            asr_reloads: AtomicU64::new(0),
+            asr_reload_skipped: AtomicU64::new(0),
             seg_queue_depth: AtomicU64::new(0),
             seg_queue_max: AtomicU64::new(0),
             frontend_iter_max_ms: AtomicU64::new(0),
@@ -320,6 +326,97 @@ pub fn load_state() -> i32 {
     LOAD_STATE.load(Ordering::Relaxed)
 }
 
+/// "同一目标已在路上就跳过"的去重器。
+///
+/// 存在的理由：`mutsurelay_set_asr_lang` 挂在"保存设置"路径上，而界面上的灵敏度
+/// 滑块每一次 `onChanged` 都会触发一次保存 —— 一次拖动就是几十次语言设置。若每次
+/// 都老实重建，就是几十次 229 MB 模型重新加载（实测每次约 1.4 s），期间解码线程
+/// 完全停摆、段队列按容量丢最旧。用户看到的是：
+/// **"只调了下灵敏度 CPU 就 10%+，之后说话还很慢、甚至明明有声音却不出字。"**
+///
+/// 抽成独立类型还为了**可单测**：真正的实例是全局的，直接测全局会在并行测试里
+/// 互相踩状态，测出来的失败既不可复现也说明不了问题。
+#[derive(Default)]
+struct ReloadDedup {
+    pending: Option<(String, String)>,
+}
+
+impl ReloadDedup {
+    /// 登记一次请求。返回 `false` 表示同一目标已经在路上，调用方不应重复发起。
+    fn request(&mut self, dir: &str, lang: &str) -> bool {
+        if self.pending.as_ref().map(|(d, l)| d == dir && l == lang) == Some(true) {
+            return false;
+        }
+        self.pending = Some((dir.to_string(), lang.to_string()));
+        true
+    }
+
+    /// 解码线程处理完一次重建后调用。
+    ///
+    /// 只有当它仍然是"最后一次请求"时才清空：期间若又来了一个不同目标的请求，
+    /// 清掉它就等于让后面那个同目标请求被误去重。
+    fn done(&mut self, dir: &str, lang: &str) {
+        if self.pending.as_ref().map(|(d, l)| d == dir && l == lang) == Some(true) {
+            self.pending = None;
+        }
+    }
+}
+
+static PENDING_RELOAD: Mutex<ReloadDedup> = Mutex::new(ReloadDedup { pending: None });
+
+/// 解码线程**当前实际装载**的目标；`None` = 没有可用 recognizer（卸载过 / 加载失败）。
+///
+/// 有它才能回答"这个目标是不是已经装好了"。`LOAD_STATE` 只说明"就绪/重建中/失败"，
+/// 不说明装的是谁 —— 少了这一层，"init_asr 装一次 + load_config 又装一次"这类
+/// 重复请求会被当成两次真实需求，白白重载 2 s / 300 MB。
+static LOADED_TARGET: Mutex<Option<(String, String)>> = Mutex::new(None);
+
+/// 判断"已装载的目标"是否就是这次要的目标。抽成纯函数便于单测
+/// （`LOADED_TARGET` 是全局的，直接测会和并行测试抢状态）。
+///
+/// 注意 `None`（没有 recognizer）**永远不匹配**：加载失败或已卸载之后，
+/// 同目标的请求必须能再次真正落地，否则会静默地一直不加载。
+fn target_matches(loaded: &Option<(String, String)>, dir: &str, lang: &str) -> bool {
+    loaded
+        .as_ref()
+        .map(|(d, l)| d == dir && l == lang)
+        .unwrap_or(false)
+}
+
+fn is_loaded(dir: &str, lang: &str) -> bool {
+    LOADED_TARGET
+        .lock()
+        .map(|l| target_matches(&l, dir, lang))
+        .unwrap_or(false)
+}
+
+/// 解码线程更新"当前装载目标"。
+fn set_loaded_target(target: Option<(String, String)>) {
+    if let Ok(mut l) = LOADED_TARGET.lock() {
+        *l = target;
+    }
+}
+
+/// 登记一次重建请求。返回 `false` 表示同一目标已在路上。
+fn mark_reload_requested(dir: &str, lang: &str) -> bool {
+    let Ok(mut p) = PENDING_RELOAD.lock() else {
+        // 锁被毒化也不能阻断重建，宁可多建一次
+        return true;
+    };
+    let accepted = p.request(dir, lang);
+    if !accepted {
+        stats().asr_reload_skipped.fetch_add(1, Ordering::Relaxed);
+    }
+    accepted
+}
+
+/// 解码线程处理完一次重建后调用，让同目标请求可以重新被接受。
+fn note_reload_done(dir: &str, lang: &str) {
+    if let Ok(mut p) = PENDING_RELOAD.lock() {
+        p.done(dir, lang);
+    }
+}
+
 /// 取（或创建）常驻解码线程。首次调用会创建线程；配合 `reload()` 即完成预热。
 pub fn engine(env: DecodeEnv) -> &'static AsrEngine {
     ENGINE.get_or_init(|| {
@@ -342,15 +439,42 @@ impl AsrEngine {
         self.queue.push_segment(SegmentJob { token, seg });
     }
 
-    /// 请求重建 recognizer。
+    /// 请求重建 recognizer。**返回是否真的发起了重建**。
+    ///
+    /// 两道短路，都是为了不让"只是调了个参数"变成一次 2 s / 300 MB 的模型重载：
+    /// 1. **已经装好就是这个目标**（`LOAD_READY` 且 `is_loaded`）→ 直接返回 `false`；
+    /// 2. 目标与"已经在路上的那次"相同 → 合并掉（[`ReloadDedup`]）。
+    ///
+    /// 需要"无论如何都重来一遍"的场景（用户点"重启 ASR"、刚下载完模型）用
+    /// [`AsrEngine::reload_forced`]。
     ///
     /// **先在调用方线程把状态置为 IDLE，再入队**：否则从"入队"到"解码线程真正取走
     /// 这个 Reload"之间，`load_state()` 仍会返回上一轮的 `LOAD_READY`。UI 是轮询这个
     /// 状态的（见 `app_state.restartAsr`），若此刻解码线程正忙于一条长段，UI 会在
     /// 几百毫秒后读到陈旧的 READY，从而**提前谎报"ASR 已重启"**。
-    pub fn reload(&self, model_dir: String, lang: String) {
+    pub fn reload(&self, model_dir: String, lang: String) -> bool {
+        self.request_reload(model_dir, lang, false)
+    }
+
+    /// 强制重建：跳过"已经装好就是这个目标"的短路。
+    ///
+    /// 用于**模型文件可能已经变了**或用户明确要求重来的场合。仍然保留"同目标已在
+    /// 路上就合并"的第二道短路 —— 那种情况下正在跑的那次已经能满足需求。
+    pub fn reload_forced(&self, model_dir: String, lang: String) -> bool {
+        self.request_reload(model_dir, lang, true)
+    }
+
+    fn request_reload(&self, model_dir: String, lang: String, forced: bool) -> bool {
+        if !forced && load_state() == LOAD_READY && is_loaded(&model_dir, &lang) {
+            stats().asr_reload_skipped.fetch_add(1, Ordering::Relaxed);
+            return false;
+        }
+        if !mark_reload_requested(&model_dir, &lang) {
+            return false;
+        }
         LOAD_STATE.store(LOAD_IDLE, Ordering::Relaxed);
         self.queue.push_ctl(Ctl::Reload { model_dir, lang });
+        true
     }
 
     pub fn flush(&self, token: u64) {
@@ -364,7 +488,7 @@ impl AsrEngine {
     /// 传空模型目录 → `create_recognizer` 返回 `None` → 旧 recognizer 被 drop；
     /// 解码线程会把状态记为 `LOAD_IDLE`（**不是** `FAILED`，这不是错误）。
     pub fn unload(&self) {
-        self.reload(String::new(), String::new());
+        let _ = self.reload(String::new(), String::new());
     }
 }
 
@@ -408,6 +532,10 @@ fn decode_loop(queue: &'static DecodeQueue, env: DecodeEnv) {
             Job::Ctl(Ctl::Reload { model_dir, lang }) => {
                 let started = Instant::now();
                 LOAD_STATE.store(LOAD_IDLE, Ordering::Relaxed);
+                // **先释放旧的再建新的**。写成 `recognizer = create_recognizer(..)` 时
+                // 新 session 会在旧 session 被 drop 之前就建好，两份 229 MB 模型
+                // （实测加载后 RSS +298 MB）同时在世，重建瞬间的峰值直接翻倍。
+                drop(recognizer.take());
                 recognizer = create_recognizer(&model_dir, &lang);
                 LOAD_STATE.store(
                     if recognizer.is_some() {
@@ -422,6 +550,16 @@ fn decode_loop(queue: &'static DecodeQueue, env: DecodeEnv) {
                 );
                 loaded_dir = model_dir.clone();
                 pipeline.reset();
+                stats().asr_reloads.fetch_add(1, Ordering::Relaxed);
+                // 只有真的建出 recognizer 才算"已装载"：加载失败后同目标的请求
+                // 必须还能重新落地，否则会静默地一直不加载。
+                set_loaded_target(
+                    recognizer
+                        .is_some()
+                        .then(|| (model_dir.clone(), lang.clone())),
+                );
+                // 让同目标的重复请求可以重新被接受
+                note_reload_done(&model_dir, &lang);
                 log::info!(
                     "[rust] ASR reloaded (dir={}, lang={}, ok={}, {}ms)",
                     model_dir,
@@ -664,6 +802,52 @@ mod tests {
         let e = AsrEngine { queue: q };
         e.reload("/x".into(), "zh".into());
         assert_eq!(load_state(), LOAD_IDLE);
+    }
+
+    /// 高频重复请求（灵敏度拖动 → 保存设置 → set_asr_lang）只能落地一次重建。
+    /// 这是"CPU 10%+ / 说话不出字"那条真机反馈的回归测试。
+    #[test]
+    fn duplicate_reload_requests_are_coalesced() {
+        let mut d = ReloadDedup::default();
+        assert!(d.request("/m", "zh"), "首次请求应当真的发起");
+        for _ in 0..50 {
+            assert!(!d.request("/m", "zh"), "同目标重复请求必须被去重");
+        }
+        // 目标变了 → 必须放行（换语言要真的生效）
+        assert!(d.request("/m", "en"), "目标变化时不应被去重");
+        // 解码线程处理完之后，同目标可以再次发起（例如用户又点了一次"重启 ASR"）
+        d.done("/m", "en");
+        assert!(d.request("/m", "en"), "处理完后同目标应可再次发起");
+    }
+
+    /// 迟到的 `done` 不能把后来那个请求的去重记录清掉，否则后续同目标请求会全部
+    /// 漏过去重，重建风暴重新出现。
+    #[test]
+    fn stale_reload_done_does_not_clear_newer_request() {
+        let mut d = ReloadDedup::default();
+        assert!(d.request("/m", "zh"));
+        assert!(d.request("/m", "en"), "目标变化应放行");
+        d.done("/m", "zh"); // 旧请求完成（迟到）
+        assert!(!d.request("/m", "en"), "新请求仍在路上，同目标应继续被去重");
+    }
+
+    /// "已装载即跳过"的判据：只有**装好且目标完全一致**才算命中。
+    ///
+    /// 尤其是 `None`（加载失败 / 被空闲卸载）绝不能命中 —— 否则同目标的请求会永远
+    /// 被跳过，表现成"点了重启 ASR 毫无反应、之后说话也不再加载模型"。
+    #[test]
+    fn loaded_target_matching_is_strict() {
+        let loaded = Some(("asr/model".to_string(), "zh".to_string()));
+        assert!(target_matches(&loaded, "asr/model", "zh"));
+        assert!(!target_matches(&loaded, "asr/model", "en"), "语言必须参与比较");
+        assert!(!target_matches(&loaded, "other/model", "zh"), "目录必须参与比较");
+        assert!(
+            !target_matches(&None, "asr/model", "zh"),
+            "没有 recognizer 时不能算命中（否则失败后永远不再加载）"
+        );
+        // 空闲卸载写回的是"空目录"，同样不能命中任何真实目标
+        let unloaded = Some((String::new(), String::new()));
+        assert!(!target_matches(&unloaded, "asr/model", "zh"));
     }
 
     #[test]

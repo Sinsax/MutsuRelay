@@ -677,4 +677,137 @@ Dart 侧据 `final` 字段把半句渲染到实时预览行，不进句列表。
 - 应用**启动时仍会预加载**模型（保证随时开录都快），所以刚打开时仍是 ~500 MB，
   90 s 无录音后才回落。
 
+---
+
+## 十二、真机反馈修复（第四轮：重建风暴 · 电平口径）
+
+用户对照旧版本给了新的实测数据：**旧版 <1% CPU / 约 370 MB / 灵敏度正常**；
+新版**没开录音、只调了一下灵敏度**，CPU 就 10%+，过一会才消停；同时"出字还是很慢，
+而且不符合直觉：明明音量电平对比这么大却没有输出"。附带日志证据：
+
+```text
+[06:58:37] ASR reloaded (dir=asr/model, lang=zh, ok=true, 1412ms)
+[06:58:39] ASR reloaded (... 1424ms)
+[06:58:40] ASR reloaded (... 1474ms)
+... 10 秒内共 8 次 ...
+[06:58:49] ASR reloaded (... 1487ms)
+```
+
+**这段日志就是全部答案**：那 10 秒里解码线程一直在重新加载 229 MB 的模型。
+
+### 12.1 根因 A：调一个滑块 = 反复重建 recognizer
+
+调用链（每一环单看都"没错"，串起来是灾难）：
+
+```text
+Slider.onChanged（拖动时每帧一次）
+  → AppState.setNoiseGateFromSlider
+    → saveSettings()                     ← 每次拖动都写配置 + 走一遍设置同步
+      → NativeBridge.setAsrLang(_asrLang)  ← 语言没变也照调
+        → mutsurelay_set_asr_lang
+          → trigger_reload()             ← 无条件重建
+            → Ctl::Reload → 解码线程 create_recognizer() ≈ 2.0~2.2 s（本机实测）
+```
+
+为什么日志不是"一次拖动一次"、而是**稳定的每 ≈1.4 s 一次**：一次重建要 2 s，
+比拖动期间两次 `onChanged` 的间隔长得多；等这次重建完成、`PENDING` 记号被清掉之后，
+紧接着来的那一拍又会被当成新请求重新发起。于是稳态频率 ≈ 1 个重建周期一次，
+与日志（10 s / 8 次）完全自洽。
+
+**为什么表现为"不出字"**：`Ctl` 是控制命令，在队列里**优先于音频段**出队；
+重建期间解码线程 100% 在加载模型，段队列（容量 4）只进不出、溢出丢最旧。
+用户说话时电平表照常跳动（它由 front-end 线程驱动，与解码无关），
+但那段音频很可能已经被丢掉了 —— 这就是"电平这么大却没输出"。
+
+### 12.2 修法：三道闸 + 显式强制
+
+| 闸 | 位置 | 作用 |
+|---|---|---|
+| ① 幂等 | `lib.rs: mutsurelay_set_asr_lang` | 语言没变直接 return，不进重建路径 |
+| ② 在途合并 | `asr.rs: ReloadDedup` + `mark_reload_requested` | 同一目标已入队 → 合并（一次拖动只会落地一次重建） |
+| ③ 已装载短路 | `asr.rs: LOADED_TARGET` + `is_loaded` | `READY` 且装的正是这个目标 → 什么都不做 |
+| 强制通道 | `AsrEngine::reload_forced` | 只有"用户点重启 ASR""模型下载完成"走它（文件可能已变） |
+
+- 闸 ③ 的 `loaded` 状态由解码线程写回，**只有真的建出 recognizer 才算命中**
+  （`recognizer.is_some()`）；加载失败或空闲卸载后写回 `None`，
+  否则同目标的请求会被永远跳过 —— 表现成"点了重启 ASR 毫无反应"。
+- Dart 侧配套：`setNoiseGateFromSlider` 不再 `saveSettings()`，改由 `Slider.onChangeEnd`
+  持久化；拖动过程只改 native 的原子量。
+- 可观测性：stats 新增 `asr_reloads` / `asr_reload_skipped`。**调参时前者必须不涨**。
+
+顺带修掉一个启动期的同类问题：应用启动会连着请求两次相同目标
+（`init_asr` 之后 `loadSettings() → mutsurelay_load_config`），旧代码会**真的装两遍**
+（2 × 2 s、峰值 2 × 298 MB）。现在被闸 ③ 短路。
+
+### 12.3 根因 B：重建瞬间新旧两份模型同时在世
+
+```rust
+recognizer = create_recognizer(&model_dir, &lang);   // 旧 session 在新 session 建好之后才 drop
+```
+`Option` 赋值是"先算右边、再析构左边"，于是重建瞬间 RSS 峰值 = 2 × 298 MB。
+改为 `drop(recognizer.take())` 后再创建。
+
+### 12.4 根因 C：电平表与噪声门不是一个能量口径
+
+| | 用的量 | 界面位置 |
+|---|---|---|
+| 电平条 | **峰值** × 10 | `mic_button.dart: level * width` |
+| 门限标线 | `gate * 10` | `mic_button.dart: gateX` |
+| **判决** | **RMS** ≥ `gate` | `segmenter.rs: push_frame` |
+
+同一段话的峰值通常比 RMS 高 3~4 倍。于是一段人耳觉得"很响"、但 RMS 低于门限的音频，
+电平条能打到 1.0（远在门线之上）而 VAD **永不进入语音态** → 一个字都不出。
+用户的原话"明明音量电平对比这么大为什么没有输出"就是这个。
+
+**修法**：电平表改用**原始 RMS** × 10（保留快启慢落弹道），与门线、与判决同口径。
+回归测试 `meter_uses_the_same_energy_domain_as_gate` 用一帧稀疏尖峰
+（峰值 0.5 / RMS 0.046 < gate 0.05）把这件事钉死：旧口径打满 1.0，新口径 0.46，
+落在门线之下 —— 与"没出字"的结论一致。
+
+### 12.5 解码耗时实测：推翻第三轮的假设
+
+新增 `native/examples/bench_decode.rs`（合成类语音音频，模型 228 MB，debug 产物）：
+
+| 音频时长 | 解码中位 | x 实时 | | 批量 | 总耗时 | 摊薄 |
+|---|---|---|---|---|---|---|
+| 0.5 s | 32 ms | 15.6× | | 1 s × 1 | 36 ms | 36 ms |
+| 1 s | 43 ms | 23.3× | | 1 s × 4 | 93 ms | 23 ms |
+| 1.5 s | 49 ms | 30.6× | | 3 s × 1 | 68 ms | 68 ms |
+| 2 s | 58 ms | 34.5× | | 3 s × 4 | 225 ms | 56 ms |
+| 3 s | 73 ms | 41.1× | | | | |
+| 4 s | 82 ms | 48.8× | | | | |
+| 8 s | 158 ms | 50.6× | | | | |
+
+**结论：解码从来不是瓶颈**（3 s 音频 73 ms）。第三轮把"卡一下才出字"归因于
+"interim 送整段导致解码耗时线性增长"，方向对（interim 确实占解码线程）但**量级估错了**
+—— 3 s 的 interim 只值 73 ms，不足以解释"很久才出字"。真正的量级来源是**重建堵死解码线程**。
+尾部窗口的改动本身无害，保留；但以后碰到"出字慢"应当先看 `asr_reloads` 与
+`dropped_segments`，而不是继续压解码耗时。
+
+### 12.6 本轮验证
+
+| 项 | 结果 |
+|---|---|
+| `cargo check --all-targets` | 通过，无警告 |
+| `cargo test` | **65 passed / 0 failed**（64 → +1，本轮共 +4 条新测试） |
+| `smoke_native.py` | **44 PASS / 0 FAIL / 0 WARN**，新增 `[6c] 重建去重` 全绿 |
+| `flutter analyze` | No issues found |
+| ABI | dll=2 / dart=2（**未增删导出符号**，只加了 Stats 字段，故不 +1） |
+| 录音链路 | 3 s 采到 336 chunks、`dropped_samples=0`；3 轮起停累计 472 chunks，每轮都在涨 |
+
+新增回归测试：
+
+- `asr::duplicate_reload_requests_are_coalesced`（50 次同目标 → 只放行 1 次）
+- `asr::stale_reload_done_does_not_clear_newer_request`（迟到的 done 不能误清新请求）
+- `asr::loaded_target_matching_is_strict`（`None` 永不命中，否则失败后不再加载）
+- `segmenter::meter_uses_the_same_energy_domain_as_gate`
+- `smoke_native.py [6c]`：30 次同值设置不重建 / 启动路径重复请求被短路 / 换语言只重建一次
+
+### 12.7 仍待确认的取舍（第三轮遗留 + 本轮新增）
+
+- 空闲卸载阈值 **90 s**：调小会更快省内存，但每次开录前要多等约 2 s（模型加载实测 2.0~2.2 s）。
+- 启动仍预加载 → 刚打开约 500 MB；若要"打开就轻"，可改成完全惰性加载，代价是首句慢 2 s。
+- interim 窗口 **3 s**：实测只值 73 ms，可放心保留；间隔 1.5 s 的 CPU 代价约 5%（仅在持续说话时）。
+
+
 
