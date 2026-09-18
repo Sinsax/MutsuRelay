@@ -80,13 +80,29 @@ if let Ok(mut r) = recognition_text().lock() {
 | P3 精度 | **已完成（Rust 侧）** | 见第八节；CER 需测试音频集才能实测 |
 | P4 整洁与可测 | **已完成** | 模块拆分 + 死代码 + 单测，见第九节；**复检记录见第十节** |
 
-**验证环境限制**：本机为 Windows，`flutter analyze` 无法执行——`.fvm/flutter_sdk`、
-`.fvm/versions/stable` 都是指向 `/home/para/fvm/versions/stable` 的 Linux 符号链接
-（`IntxLNK` 前缀），是双系统切换后的残留，Windows 侧解析不到。因此 Dart 改动通过
-"导出符号比对 + 逐段人工复核"验证，未过分析器。
+**验证环境**：`flutter analyze` **实际可以执行**。此前记录的"Windows 侧无 Flutter SDK"是误判——
+SDK 装在 `C:\Users\para\flutter\flutter`（3.44.0 stable / Dart 3.12.0），只是没进 PATH，
+而 PATH 里那条 `F:\para\Code\flutter\bin` 是失效路径。`.fvm/*` 确实是指向
+`/home/para/fvm/versions/stable` 的 Linux 符号链接（`IntxLNK` 残留），但 Windows 侧用的是
+上面那套独立 SDK，与 `.fvm` 无关。
+
+实测（2026-09-18，经绝对路径调用）：
+
+| 命令 | 结果 |
+|---|---|
+| `flutter analyze` | **No issues found**（修掉 1 个 `unnecessary_non_null_assertion` 后） |
+| `flutter test` | **All tests passed**（1 个 widget test） |
+
+两个环境坑：
+1. `flutter test` 会被本机代理打挂——`HTTP_PROXY/HTTPS_PROXY=127.0.0.1:13605` 同样代理了
+   flutter_tester 的 WebSocket，报 `Invalid WebSocket upgrade request`。跑前设
+   `NO_PROXY=127.0.0.1,localhost` 或清空代理变量。
+2. 任何 `flutter analyze|test|run` 都会重写 `linux|windows/flutter/generated_plugin_registrant.cc`
+   与 `generated_plugins.cmake`。内容与仓库一致，但 `core.autocrlf=true` 会让它们显示为
+   modified（纯行尾差异）。跑完用 `git checkout --` 还原这 4 个文件。
 
 补充手段：`native/tools/smoke_native.py` —— 用 ctypes 直接加载 DLL 跑 C API 全链路，
-替代"跑不起来 Flutter 就没法验证"的困境。
+在没有 Flutter 运行时的场景（CI、纯 native 改动）依然能端到端验证。
 
 ### C API 版本（ABI_VERSION = 2）
 
@@ -356,7 +372,7 @@ native/src/
 | `cargo build`（debug） | 通过，DLL 15.9 MB |
 | DLL 导出 ↔ Dart 绑定比对 | Dart 需要的 **39 个符号全部存在**；DLL 仅多出 `mutsurelay_get_stats`（有意未绑定） |
 | DLL 同步 | 已复制到 `windows/mutsurelay_native/` 与 `build/windows/x64/runner/Debug/` |
-| `flutter analyze` | **无法执行**（Flutter SDK 在 Windows 侧不可用，见第一节补） |
+| `flutter analyze` | **通过**（No issues found）——原判"无法执行"为误判，见"验证环境"一节 |
 
 **尚未验证**：真机录音链路（需要跑起 Flutter 应用）。P1 的判据"连推 2 段不丢句 / 切语言立即生效 / 拔麦克风有报错"
 目前只有静态与单测层面的支撑，需在能跑 Flutter 的环境上实测。
@@ -508,7 +524,7 @@ Dart 侧据 `final` 字段把半句渲染到实时预览行，不进句列表。
 | 其中：`asr_state` | 后台 reload 后达到就绪(1) —— **240 MB 模型确实被常驻解码线程加载成功** |
 | 其中：录音链路 | 抓到 USB PnP 麦克风（1ch 48kHz），4 s 内 `captured_chunks=436`，`dropped_samples=0`，电平峰值 0.30 |
 | 其中：快速起停 ×3 | 最终回到停止态，无残留 pipeline |
-| `flutter analyze` | **仍无法执行**（Flutter SDK 在 Windows 侧不可用） |
+| `flutter analyze` | **通过**（No issues found）；本轮复检时确认 SDK 可用 |
 
 ### 9.4 尚未验证 / 遗留
 
@@ -564,7 +580,8 @@ Dart 侧据 `final` 字段把半句渲染到实时预览行，不进句列表。
 | `smoke_native.py` | **40 PASS / 0 FAIL / 0 WARN**（新 DLL 重跑；录音链路 338–485 chunks、`dropped_samples=0`、电平峰值 0.32–0.71） |
 | 其中：**3 轮起停每轮都重新采到音频** | `captured_chunks` 逐轮增长（338 → 479 → …）。**这条是本轮新加的断言**：原先只断言"最终回到停止态"，而"第二轮起不来"（旧 stream 未 drop → 设备被占用）同样会回到停止态，测试会假通过 |
 | 其中：急速起停 ×3 | 最终回到停止态，`dropped_segments=0` 无残留 |
-| `flutter analyze` | 仍无法执行（Windows 侧无 Flutter SDK） |
+| `flutter analyze` | **通过**（No issues found）—— 修正 `unnecessary_non_null_assertion` 之后 |
+| `flutter test` | **通过**（All tests passed）—— 注意需 `NO_PROXY=127.0.0.1,localhost` 绕开本机代理 |
 
 > 环境备注：本机的 PowerShell 会话里 `rustc` 不在 PATH（`native/build.ps1` 2 秒即退且无输出）。
 > 在本环境重建 DLL 请走 `cd native && cargo build`，再手动同步 `mutsurelay_native.{dll,pdb,lib}`

@@ -3,22 +3,31 @@
 ## Commands
 
 ```sh
-fvm flutter analyze                    # gate before commit
-fvm flutter test                       # widget test (single)
-fvm flutter run -d linux               # builds Rust + bundles deps via CMake
-fvm flutter run -d windows             # same on Windows
-fvm dart run tool/build_and_run.dart    # fastest dev loop: Rust build + flutter run, skips cmake
-fvm dart run tool/package.dart          # builds release + AppImage + tar.gz (Linux) or Inno Setup + ZIP (Windows)
+flutter analyze                        # gate before commit
+flutter test                           # widget test (single)
+flutter run -d windows                 # builds Rust + bundles deps via CMake
+flutter run -d linux                   # same on Linux
+dart run tool/build_and_run.dart        # fastest dev loop: Rust build + flutter run, skips cmake
+dart run tool/package.dart              # builds release + AppImage + tar.gz (Linux) or Inno Setup + ZIP (Windows)
 native/build.sh                        # cargo build + copy .so to linux/mutsurelay_native
 native/build.ps1                       # same for .dll → windows/mutsurelay_native
-cargo test                             # 58 Rust unit tests (censor/audio/segmenter/text/asr)
+cargo test                             # 59 Rust unit tests (censor/audio/segmenter/text/asr)
 cargo check --all-targets              # fast Rust compile check (includes examples/ + tests)
 cargo run --example replay -- --help   # offline replay + CER, for accuracy A/B on a WAV
 python native/tools/smoke_native.py    # runtime smoke test of the C API (works without Flutter)
-fvm flutter clean                      # fix stale C++ build cache after Dart-only changes
+flutter clean                          # fix stale C++ build cache after Dart-only changes
 ```
 
-- FVM auto-detected on Linux (`fvm` on PATH → `fvm flutter`); Windows always uses plain `flutter`.
+- Linux uses `fvm flutter …` (`fvm` is on PATH there); Windows has no fvm — use plain `flutter`.
+- **Windows: Flutter is at `C:\Users\para\flutter\flutter\bin` and is NOT on PATH** (the PATH entry
+  `F:\para\Code\flutter\bin` is a dead path). Call it by absolute path, e.g.
+  `& "C:\Users\para\flutter\flutter\bin\flutter.bat" analyze`, or fix PATH.
+- **`flutter test` breaks behind the local proxy**: `HTTP_PROXY/HTTPS_PROXY=127.0.0.1:13605` is
+  applied to the flutter_tester WebSocket → `Invalid WebSocket upgrade request`. Clear them (or set
+  `NO_PROXY=127.0.0.1,localhost`) before running tests.
+- Any `flutter analyze|test|run` rewrites `linux|windows/flutter/generated_plugin_registrant.cc` and
+  `generated_plugins.cmake`. Content is identical; with `core.autocrlf=true` git still shows them as
+  modified (line endings only). `git checkout --` those 4 files after a run.
 - `cargo test` links a large sherpa-onnx/onnxruntime stack — run it in the background, it can exceed the foreground timeout.
 - CI (`.github/workflows/build.yml.disabled`): rename to `build.yml` to enable. Jobs: analyze → build-windows + build-linux (sequential deps, not parallel).
 - Version single source of truth: `version:` in `pubspec.yaml`.
