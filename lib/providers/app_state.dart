@@ -88,7 +88,8 @@ class AppState extends ChangeNotifier {
       }
 
       if (recording) {
-        final p = poll!;
+        // recording 为 true 已蕴含 poll != null，无需再断言
+        final p = poll;
         _audioLevel = (p['level'] as num?)?.toDouble() ?? 0.0;
         audioLevelNotifier.value = _audioLevel;
         final inSpeech = p['in_speech'] == true;
