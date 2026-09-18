@@ -73,6 +73,12 @@ const FRONTEND_READ: usize = 8_192;
 const INTERIM_INTERVAL: Duration = Duration::from_millis(1500);
 /// interim 至少要有这么长的段才值得跑
 const INTERIM_MIN_SEGMENT_MS: u64 = 1500;
+/// 停止录音后多久（期间没有新录音）把 recognizer 卸掉。
+///
+/// 常驻 recognizer 是"首句近零延迟"的关键，代价是**一直**占约 300 MB
+/// （实测：模型文件 228 MB → 加载后 RSS +298 MB）。而重建只要约 1 s，
+/// 所以长期不录音时留着并不划算。90 s 足以覆盖"录一段、停一下、接着录"的节奏。
+const IDLE_UNLOAD_DELAY: Duration = Duration::from_secs(90);
 
 fn noise_gate() -> &'static Mutex<f32> {
     NOISE_GATE.get_or_init(|| Mutex::new(0.02))
@@ -135,9 +141,14 @@ fn engine() -> &'static asr::AsrEngine {
     asr::engine(decode_env())
 }
 
+/// 每次主动重建 recognizer 都自增。空闲卸载线程据此判断"这段时间里有没有人动过 ASR"，
+/// 否则会出现：用户刚点完"重启 ASR"，卸载线程紧接着把模型丢掉 → 静默失效。
+static RELOAD_GEN: AtomicU64 = AtomicU64::new(0);
+
 /// 让解码线程用当前模型目录 / 语言重建（或首次创建）recognizer。
 /// 线程常驻，所以"重建"发生在后台，界面不会卡；空闲时即等于预热。
 fn trigger_reload() {
+    RELOAD_GEN.fetch_add(1, Ordering::SeqCst);
     let dir = model_dir().lock().map(|d| d.clone()).unwrap_or_default();
     let lang = asr_lang().lock().map(|l| l.clone()).unwrap_or_default();
     engine().reload(dir, lang);
@@ -536,6 +547,11 @@ pub extern "C" fn mutsurelay_start_recording() -> i32 {
         return 0;
     }
     set_pipeline_error(String::new());
+    // 若 recognizer 被"空闲卸载"过（或还没建），立刻在后台重建：
+    // 这 ~1 s 与用户开口的时间重叠，不必等到首句语音才加载。
+    if asr::load_state() != asr::LOAD_READY {
+        trigger_reload();
+    }
     IS_RECORDING.store(true, Ordering::SeqCst);
     let token = start_session();
     log::info!("[rust] recording session started (token={token})");
@@ -545,6 +561,37 @@ pub extern "C" fn mutsurelay_start_recording() -> i32 {
 #[no_mangle]
 pub extern "C" fn mutsurelay_stop_recording() {
     IS_RECORDING.store(false, Ordering::SeqCst);
+    schedule_idle_unload();
+}
+
+/// 空闲卸载：停止录音后若迟迟没有新录音，就把 recognizer 丢掉，把约 300 MB 还给系统。
+///
+/// 只起一个一次性计时线程，醒来后核对会话代际：期间只要重新开录（`RUN_TOKEN` 变了）
+/// 或仍在录音，就什么都不做。多次起停会留下多个等待中的线程，但它们都会自行退出；
+/// 90 s 内起停的次数量级很小，不值得为此引入更复杂的机制。
+fn schedule_idle_unload() {
+    let token = RUN_TOKEN.load(Ordering::SeqCst);
+    let gen = RELOAD_GEN.load(Ordering::SeqCst);
+    let _ = thread::Builder::new()
+        .name("mutsurelay-idle-unload".into())
+        .spawn(move || {
+            thread::sleep(IDLE_UNLOAD_DELAY);
+            // 又开录了 / 换了会话 / 这段时间里有人主动重建过 ASR（例如用户点了"重启"）
+            // —— 任何一种情况都取消本次卸载
+            if IS_RECORDING.load(Ordering::SeqCst)
+                || RUN_TOKEN.load(Ordering::SeqCst) != token
+                || RELOAD_GEN.load(Ordering::SeqCst) != gen
+            {
+                return;
+            }
+            if asr::load_state() == asr::LOAD_READY {
+                engine().unload();
+                log::info!(
+                    "[rust] idle for {:?}, recognizer unloaded (~300 MB returned to OS)",
+                    IDLE_UNLOAD_DELAY
+                );
+            }
+        });
 }
 
 #[no_mangle]

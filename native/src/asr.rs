@@ -250,14 +250,17 @@ impl DecodeQueue {
         self.inner.lock().map(|i| i.segs.len() as u64).unwrap_or(0)
     }
 
-    /// 阻塞取一个 job。控制命令优先（保证 Reload 及时生效）。
+    /// 阻塞取一个 job。控制命令优先（保证 Reload 及时生效），其次是**正式段**。
+    ///
+    /// interim 只是界面预览，绝不能挡在正式段前面：否则用户说完一句话，正式段要等
+    /// 一个半句解完才轮到，表现为"卡一下才出字"。
     fn pop(&self) -> Option<Job> {
         let mut inner = self.inner.lock().ok()?;
         loop {
             if let Some(c) = inner.ctl.pop_front() {
                 return Some(Job::Ctl(c));
             }
-            if let Some(s) = inner.segs.pop_front() {
+            if let Some(s) = Self::pop_prefer_final(&mut inner) {
                 let d = inner.segs.len() as u64;
                 drop(inner);
                 stats().seg_queue_depth.store(d, Ordering::Relaxed);
@@ -267,10 +270,18 @@ impl DecodeQueue {
         }
     }
 
-    /// 非阻塞取下一段（用于批处理），不取控制命令。
+    /// 取下一个段：优先非 interim 的正式段。队列容量 ≤ 4，线性查找的开销可忽略。
+    fn pop_prefer_final(inner: &mut QueueInner) -> Option<SegmentJob> {
+        if let Some(pos) = inner.segs.iter().position(|j| !j.seg.interim) {
+            return inner.segs.remove(pos);
+        }
+        inner.segs.pop_front()
+    }
+
+    /// 非阻塞取下一段（用于批处理），不取控制命令。同样优先正式段。
     fn try_pop_segment(&self) -> Option<SegmentJob> {
         let mut inner = self.inner.lock().ok()?;
-        let s = inner.segs.pop_front();
+        let s = Self::pop_prefer_final(&mut inner);
         let d = inner.segs.len() as u64;
         drop(inner);
         stats().seg_queue_depth.store(d, Ordering::Relaxed);
@@ -345,6 +356,16 @@ impl AsrEngine {
     pub fn flush(&self, token: u64) {
         self.queue.push_ctl(Ctl::Flush { token });
     }
+
+    /// 丢弃 recognizer，把内存还给系统；下次 `reload` 会重建。
+    ///
+    /// 用于"空闲太久"的场景（见 `lib.rs` 的 `IDLE_UNLOAD_DELAY`）：加载约 1 s，
+    /// 但常驻约 300 MB，长期不录音时留着不划算。
+    /// 传空模型目录 → `create_recognizer` 返回 `None` → 旧 recognizer 被 drop；
+    /// 解码线程会把状态记为 `LOAD_IDLE`（**不是** `FAILED`，这不是错误）。
+    pub fn unload(&self) {
+        self.reload(String::new(), String::new());
+    }
 }
 
 /// 按线上完全相同的配置创建 recognizer（replay 回放工具也复用这个函数，
@@ -389,7 +410,14 @@ fn decode_loop(queue: &'static DecodeQueue, env: DecodeEnv) {
                 LOAD_STATE.store(LOAD_IDLE, Ordering::Relaxed);
                 recognizer = create_recognizer(&model_dir, &lang);
                 LOAD_STATE.store(
-                    if recognizer.is_some() { LOAD_READY } else { LOAD_FAILED },
+                    if recognizer.is_some() {
+                        LOAD_READY
+                    } else if model_dir.is_empty() {
+                        // 空目录 = 主动卸载（空闲省内存），不是加载失败
+                        LOAD_IDLE
+                    } else {
+                        LOAD_FAILED
+                    },
                     Ordering::Relaxed,
                 );
                 loaded_dir = model_dir.clone();
@@ -408,11 +436,19 @@ fn decode_loop(queue: &'static DecodeQueue, env: DecodeEnv) {
             Job::Seg(first) => {
                 // 批量收集：把队列里紧随其后的同代际段一起解，提高吞吐
                 let mut batch = vec![first];
+                let first_is_interim = batch[0].seg.interim;
                 while batch.len() < BATCH_MAX {
                     match queue.try_pop_segment() {
-                        Some(next) if next.token == batch[0].token => batch.push(next),
+                        // 只合并"同代际 + 同类型"的段：interim 与正式段混在一批里，
+                        // 会让正式段的解码被动等半句解完，反而加重出字延迟。
+                        Some(next)
+                            if next.token == batch[0].token
+                                && next.seg.interim == first_is_interim =>
+                        {
+                            batch.push(next)
+                        }
                         Some(next) => {
-                            // 不是同一代际：放回去（顺序会略微错位，但代际不同的段本来就要丢）
+                            // 代际或类型不同：放回去（顺序会略微错位，但这两类本来就要分别处理）
                             queue.push_segment(next);
                             break;
                         }
@@ -563,6 +599,26 @@ mod tests {
         }
         assert_eq!(ids, vec![3, 4, 5, 6]);
         assert!(stats().dropped_segments.load(Ordering::Relaxed) >= 3);
+    }
+
+    /// 正式段必须优先于 interim 出队。interim 只是界面预览，
+    /// 挡在正式段前面会让用户"说完一句话卡一下才出字"。
+    #[test]
+    fn final_segment_is_popped_before_interim() {
+        let q = DecodeQueue::new();
+        let mut i_seg = seg(1, 100);
+        i_seg.interim = true;
+        let f_seg = seg(2, 100); // interim 默认 false
+        // 先压 interim，再压正式段：出队顺序必须反过来
+        q.push_segment(SegmentJob { token: 1, seg: i_seg });
+        q.push_segment(SegmentJob { token: 1, seg: f_seg });
+
+        let first = q.try_pop_segment().expect("应有段可出队");
+        assert!(!first.seg.interim, "正式段必须先出队");
+        assert_eq!(first.seg.id, 2);
+        let second = q.try_pop_segment().expect("应有段可出队");
+        assert!(second.seg.interim, "interim 随后出队");
+        assert_eq!(second.seg.id, 1);
     }
 
     #[test]

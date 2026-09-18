@@ -23,6 +23,12 @@ pub const VAD_FRAME_SAMPLES: usize = ASR_SAMPLE_RATE as usize * VAD_FRAME_MS as 
 pub const DEFAULT_MAX_SEGMENT_MS: u32 = 8_000;
 /// 起点之前保留的音频长度（真正的 pre-roll）。
 pub const DEFAULT_PRE_ROLL_MS: u32 = 300;
+/// interim（实时半句）快照最多回看多长的音频。
+///
+/// 实时预览只关心"最近在说什么"，没必要每次都把整段（最长 8 s）送进识别器：
+/// 那样每次 interim 的解码耗时随段长线性增长，而它会占住解码线程，
+/// 让紧随其后的正式段排队 —— 表现为"说完一句话要卡一下才出字"。
+pub const DEFAULT_INTERIM_WINDOW_MS: u32 = 3_000;
 /// 静音判停门限。
 pub const DEFAULT_MIN_SILENCE_MS: u32 = 300;
 /// 兜底静音门限：即便语音帧数不足也切段，避免段无限增长。
@@ -50,6 +56,8 @@ pub struct SegmenterConfig {
     pub max_silence_frames: u32,
     pub max_segment_samples: usize,
     pub pre_roll_samples: usize,
+    /// interim 快照最多回看的音频长度（见 `DEFAULT_INTERIM_WINDOW_MS`）
+    pub interim_window_samples: usize,
     pub energy_floor: f32,
     /// 用户设置的噪声门（与原始能量同口径）
     pub gate: f32,
@@ -65,6 +73,7 @@ impl Default for SegmenterConfig {
             max_silence_frames: (DEFAULT_MAX_SILENCE_MS / VAD_FRAME_MS).max(1),
             max_segment_samples: ms_to_samples(DEFAULT_MAX_SEGMENT_MS),
             pre_roll_samples: ms_to_samples(DEFAULT_PRE_ROLL_MS),
+            interim_window_samples: ms_to_samples(DEFAULT_INTERIM_WINDOW_MS),
             energy_floor: DEFAULT_ENERGY_FLOOR,
             gate: 0.02,
             suppress: true,
@@ -229,17 +238,30 @@ impl Segmenter {
     }
 
     /// 取当前未完成段的一份快照，用于 interim（实时半句）识别。
+    ///
+    /// **只取尾部窗口**（`cfg.interim_window_samples`，默认 3 s），而不是整段。
+    /// interim 与正式段共用解码线程：若每次都送整段（最长 8 s），解码耗时会随句长
+    /// 增长，把紧随其后的正式段挡在后面——用户感受就是"说完一句话要卡一下才出字"。
+    /// 实时预览本来也只需要"最近在说什么"，尾部窗口足够。
     pub fn interim_snapshot(&self) -> Option<Segment> {
         if !self.in_speech || self.seg_audio.len() < self.cfg.frame_samples * 4 {
             return None;
         }
+        let take = self
+            .seg_audio
+            .len()
+            .min(self.cfg.interim_window_samples.max(self.cfg.frame_samples));
+        let start = self.seg_audio.len() - take;
         Some(Segment {
             id: u64::MAX, // interim 不占用正式段号
-            onset_ms: self.seg_onset_ms,
-            duration_ms: self.current_segment_ms(),
-            pre_roll: self.seg_pre_roll.clone(),
-            audio: self.seg_audio.clone(),
-            seam_overlap_ms: self.seg_seam_overlap_ms,
+            // 窗口起点 = 段起点 + 段内偏移
+            onset_ms: self.seg_onset_ms + samples_to_ms(start),
+            duration_ms: samples_to_ms(take),
+            // 尾部窗口自带上下文，不必再补"段起点之前"的 pre-roll
+            pre_roll: Vec::new(),
+            audio: self.seg_audio[start..].to_vec(),
+            // interim 不参与接缝去重
+            seam_overlap_ms: 0,
             interim: true,
         })
     }
@@ -783,6 +805,28 @@ mod tests {
         assert!(!finals.is_empty(), "静音后应产出一个正式段");
         assert!(finals.iter().all(|s| !s.interim), "正式段不能带 interim 标记");
         assert!(finals.iter().all(|s| s.id != u64::MAX), "正式段应有正常段号");
+    }
+
+    /// interim 快照必须**只取尾部窗口**，不能把整段送进识别器。
+    /// 它与正式段共用解码线程，送整段会让解码耗时随句长增长，把紧随其后的
+    /// 正式段挡在后面 —— 用户感受就是"说完一句话要卡一下才出字"。
+    #[test]
+    fn interim_snapshot_is_capped_to_tail_window() {
+        let mut c = cfg();
+        c.interim_window_samples = 16_000; // 1 s 窗口
+        let mut s = Segmenter::new(c);
+        let mut out = Vec::new();
+        // 连续 3 s 语音（远超 1 s 窗口），中间不给静音
+        push_many(&mut s, &frames_at(100, SPEECH), &mut out);
+        let snap = s.interim_snapshot().expect("应有 interim 快照");
+        assert_eq!(
+            snap.audio.len(),
+            16_000,
+            "超过窗口时必须恰好截取尾部一个窗口，实际 {}",
+            snap.audio.len()
+        );
+        assert!(snap.pre_roll.is_empty(), "尾部窗口不该再带段起点前的 pre-roll");
+        assert_eq!(snap.duration_ms, 1000, "duration 应反映窗口长度");
     }
 
     #[test]

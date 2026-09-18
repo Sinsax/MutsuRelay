@@ -587,3 +587,94 @@ Dart 侧据 `final` 字段把半句渲染到实时预览行，不进句列表。
 > 在本环境重建 DLL 请走 `cd native && cargo build`，再手动同步 `mutsurelay_native.{dll,pdb,lib}`
 > 与 4 个依赖 DLL 到 `windows/mutsurelay_native/` 与 `build/windows/x64/runner/Debug/`。
 
+---
+
+## 十一、真机反馈修复（第三轮：用户实测报告）
+
+用户在使用后报了 4 个问题，全部复现并定位到根因。其中 **问题 1 与问题 3 同源**。
+
+### 11.1 识别慢 + 灵敏度调低后 CPU 飙升 —— 同一根因：interim 抢解码线程
+
+**症状**：说一句话后要卡一下才出字；把"灵敏度"调灵敏（= 噪声门调低）后 CPU 飙升。
+
+**根因**（两处叠加）：
+
+1. `Segmenter::interim_snapshot` 把**整段** `seg_audio.clone()` 出去（最长 8 s），而不是一个固定窗口。
+   于是每次 interim 的解码耗时**随句长线性增长**：说到 8 s 时，每 1.5 s 就要解一段 8 s 音频。
+2. `DecodeQueue::pop` 按 **FIFO** 取段，而 interim 与正式段共用同一个队列、同一条解码线程。
+   用户说完话时，正式段往往正好排在一个 interim 后面 → 必须等它解完才轮到正式段。
+
+**灵敏度为何放大它**：噪声门调低 → 环境噪声也被判为语音 → `in_speech` 长期为真 →
+`current_segment_ms() >= 1500` 恒成立 → interim **每 1.5 s 跑一次且从不停止**，
+每次还是接近 8 s 的音频，CPU 于是被吃满。
+
+**修法**：
+
+| 改动 | 位置 |
+|---|---|
+| interim 只取**尾部窗口**（`DEFAULT_INTERIM_WINDOW_MS = 3000`），解码成本封顶 | `segmenter.rs`：`interim_snapshot` + 新配置项 `interim_window_samples` |
+| 出队**正式段优先**（`pop_prefer_final`），interim 绝不挡在正式段前面 | `asr.rs`：`pop` / `try_pop_segment` |
+| 批处理只合并"同代际 **且** 同 interim 属性"的段，不把半句与正式段混一批 | `asr.rs`：`decode_loop` |
+
+回归测试：`interim_snapshot_is_capped_to_tail_window`、`final_segment_is_popped_before_interim`。
+
+### 11.2 敏感词要首字母缩写，不要全拼
+
+**症状**：`妈的` → `made`，期望 `md`。
+
+**根因**：`censor.rs` 对**≤2 字的命中片段**走 `to_full_pinyin`（全拼），3 字以上才走首字母。
+这条"2 字全拼"规则既与 `AGENTS.md` 的约定（Mode 2 → pinyin initials）不符，
+也让同一个词按长度出现两套风格。
+
+**修法**：mode 2 **一律** `to_initials`；删掉 `to_full_pinyin` 死函数。
+于是 `妈的` → `md`、`傻逼` → `sb`、`弱智` → `rz`、`操你妈` → `cnm`。
+
+回归测试：`test_initials_two_char`（"妈的" → "md"）、`test_partial_replacement_keeps_context`。
+
+### 11.3 内存 500 MB —— 量化后定位为模型常驻
+
+用 `native/tools/mem_probe.py`（ctypes 加载 DLL，逐步量 RSS）实测：
+
+| 阶段 | RSS | 增量 |
+|---|---|---|
+| 进程基线 | 21.9 MB | — |
+| 加载 DLL | 24.3 MB | +2.4 |
+| 起解码线程 + 环形缓冲（**不含模型**） | 26.9 MB | +2.6 |
+| **加载 ASR 模型后** | **325.1 MB** | **+298.2** |
+| **卸载模型后** | **49.4 MB** | **−275.7** |
+
+- 模型文件 228 MB，onnxruntime 加载后占 **298 MB**；加载耗时 **997 ms**。
+- **卸载后内存确实归还给 OS**（残留仅 +22.5 MB）→ 说明"空闲卸载"方案可行。
+- 用户看到的 500 MB ≈ 这 298 MB + Flutter 运行时（引擎 + Dart VM ≈ 200 MB）。**不是泄漏。**
+
+**修法**：新增**空闲卸载**（不增删导出符号，故 ABI 保持 2）：
+
+- `mutsurelay_stop_recording` 起一个一次性计时线程，`IDLE_UNLOAD_DELAY = 90 s`。
+- 到期核对三件事，任一不满足即取消：仍在录音 / 会话代际（`RUN_TOKEN`）变了 /
+  期间有人主动重建过 ASR（新增 `RELOAD_GEN`）。
+- 通过则 `AsrEngine::unload()` → `reload("")` → `create_recognizer` 返回 `None` → 旧 recognizer 被 drop。
+- 解码线程把"空目录"记为 `LOAD_IDLE`（**不是** `LOAD_FAILED`，这不是错误）。
+- `mutsurelay_start_recording` 若发现状态非 READY，会**立刻后台重建**，让这 ~1 s 与用户开口的时间重叠。
+
+> 第三项检查（`RELOAD_GEN`）是必需的：否则用户刚点完"重启 ASR"、卸载线程紧接着把模型丢掉，会静默失效。
+
+### 11.4 本轮验证
+
+| 项 | 结果 |
+|---|---|
+| `cargo check --all-targets` | 通过，无警告 |
+| `cargo test` | **61 passed / 0 failed**（原 58 → +3） |
+| `smoke_native.py` | **40 PASS / 0 FAIL / 0 WARN**，其中 `censor mode 2` 断言已变为 `你这个fw`（首字母生效） |
+| ABI | dll=2 / dart=2（本轮**未增删导出符号**，故不 +1） |
+| 录音链路 | 3 s 采到 336 chunks、`dropped_samples=0`；3 轮起停累计 471 chunks，每轮都在涨 |
+
+### 11.5 仍待确认的取舍
+
+- interim 窗口取 **3 s**：预览只覆盖"最近在说的一句"。若嫌预览太短可调大
+  （`DEFAULT_INTERIM_WINDOW_MS`），代价是每次 interim 解码变慢。
+- 空闲卸载阈值 **90 s**：直播中一直在录则永不触发；若希望"不录音就尽快释放"，
+  可调小该常量，或改成"启动时根本不预加载"（代价是每次录音第一句前多等约 1 s）。
+- 应用**启动时仍会预加载**模型（保证随时开录都快），所以刚打开时仍是 ~500 MB，
+  90 s 无录音后才回落。
+
+

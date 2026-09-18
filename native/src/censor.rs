@@ -58,12 +58,6 @@ fn to_initials(word: &str) -> String {
         .collect()
 }
 
-fn to_full_pinyin(word: &str) -> String {
-    word.to_pinyin()
-        .filter_map(|p| p.map(|py| py.plain().to_string()))
-        .collect()
-}
-
 pub fn censor(text: &str, mode: i32) -> String {
     if mode == 0 {
         return text.to_string();
@@ -120,10 +114,10 @@ pub fn censor(text: &str, mode: i32) -> String {
     }
 
     // Phase 3: build result, replacing each span
-    // 替换规则按"每个命中片段"独立判断，与该片段在整句中的位置无关：
-    //   2 字以内的词 → 全拼；更长的词 → 首字母。
-    // 此前是"整句恰好等于 2 字屏蔽词才用全拼"的整句特例，导致同一个词在不同
-    // 上下文里被替换成不同结果。
+    // mode 2 一律取**拼音首字母**（"妈的" → "md"、"傻逼" → "sb"），
+    // 与该片段长度、在句中的位置都无关。
+    // 曾对 ≤2 字片段用全拼（"妈的" → "made"），但全拼更长、辨识度反而更低，
+    // 用户明确要求统一首字母；这也与 AGENTS.md 的约定一致。
     let mut result = String::with_capacity(text.len());
     let mut pos = 0;
     for (start, end) in spans {
@@ -132,11 +126,7 @@ pub fn censor(text: &str, mode: i32) -> String {
         }
         let span_text: String = chars[start..end].iter().collect();
         let replacement = if mode == 2 {
-            if end - start <= 2 {
-                to_full_pinyin(&span_text)
-            } else {
-                to_initials(&span_text)
-            }
+            to_initials(&span_text)
         } else {
             "[***]".to_string()
         };
@@ -210,7 +200,7 @@ mod tests {
         let _g = setup(vec!["傻逼", "废物"]);
         // 中间隔字才是真正的"不相邻"，各自独立替换。
         // （相邻的屏蔽词会被合并成一个 span，见 test_adjacent_words_merge_into_one_span）
-        assert_eq!(censor("你个傻逼真废物", 2), "你个shabi真feiwu");
+        assert_eq!(censor("你个傻逼真废物", 2), "你个sb真fw");
     }
 
     #[test]
@@ -242,14 +232,17 @@ mod tests {
         assert_eq!(censor("操你妈逼", 2), "cnmb");
     }
 
+    /// 2 字词同样取首字母："妈的" → "md"，**不是** "made"。
+    /// 全拼更长、辨识度反而低，用户明确要求统一首字母。
     #[test]
-    fn test_full_pinyin_two_char() {
-        let _g = setup(vec!["弱智"]);
-        assert_eq!(censor("弱智", 2), "ruozhi");
+    fn test_initials_two_char() {
+        let _g = setup(vec!["妈的"]);
+        assert_eq!(censor("妈的", 2), "md");
+        assert_eq!(censor("你妈的", 2), "你md");
     }
 
     #[test]
-    fn test_full_pinyin_two_char_asterisk() {
+    fn test_two_char_asterisk() {
         let _g = setup(vec!["傻逼"]);
         assert_eq!(censor("傻逼", 1), "[***]");
     }
@@ -261,18 +254,18 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_full_pinyin_not_full_coverage() {
+    fn test_partial_replacement_keeps_context() {
         let _g = setup(vec!["废物"]);
-        assert_eq!(censor("你个废物", 2), "你个feiwu");
+        assert_eq!(censor("你个废物", 2), "你个fw");
     }
 
     /// 逐片段规则的核心保证：同一个词在任何上下文里替换结果一致。
     #[test]
     fn test_same_word_consistent_across_contexts() {
         let _g = setup(vec!["弱智"]);
-        assert_eq!(censor("弱智", 2), "ruozhi");
-        assert_eq!(censor("你个弱智", 2), "你个ruozhi");
-        assert_eq!(censor("弱智吧你", 2), "ruozhi吧你");
+        assert_eq!(censor("弱智", 2), "rz");
+        assert_eq!(censor("你个弱智", 2), "你个rz");
+        assert_eq!(censor("弱智吧你", 2), "rz吧你");
     }
 
     /// 首字索引：命中结果必须与全表扫描等价。
