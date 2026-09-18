@@ -1,10 +1,11 @@
 use reqwest::header::{COOKIE, SET_COOKIE};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Condvar, LazyLock, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static COOKIE_TEXT: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
 static CONNECTED: AtomicBool = AtomicBool::new(false);
@@ -15,7 +16,15 @@ static CLOSE_BEHAVIOR: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new("hi
 static USER_INFO: LazyLock<Mutex<Option<UserInfo>>> = LazyLock::new(|| Mutex::new(None));
 static LAST_ERROR: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
 static SUBTITLE_FILE_PATH: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
-static MEMORY_SENSITIVITY: LazyLock<Mutex<f32>> = LazyLock::new(|| Mutex::new(0.5));
+/// 字幕文件的内存尾窗（最近 [`SUBTITLE_TAIL_MAX`] 行）。
+/// 旧实现每写一条都 `read_to_string` + `write` 整个文件，且发生在解码线程里。
+static SUBTITLE_TAIL: LazyLock<Mutex<Vec<String>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+const SUBTITLE_TAIL_MAX: usize = 20;
+/// 异步发送任务序号
+static SEND_SEQ: AtomicU64 = AtomicU64::new(0);
+/// 异步发送的完成结果，供 Dart 轮询取回
+static SEND_RESULTS: LazyLock<Mutex<VecDeque<serde_json::Value>>> =
+    LazyLock::new(|| Mutex::new(VecDeque::new()));
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct UserInfo {
@@ -57,8 +66,6 @@ pub struct Config {
     pub close_behavior: String,
     #[serde(default)]
     pub subtitle_file_path: String,
-    #[serde(default = "default_memory_sensitivity")]
-    pub memory_sensitivity: f32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -75,10 +82,145 @@ fn default_censor_mode() -> i32 { 2 }
 fn default_noise_suppress() -> bool { true }
 fn default_language() -> String { "zh".to_string() }
 fn default_close_behavior() -> String { "hide".to_string() }
-fn default_memory_sensitivity() -> f32 { 0.5 }
 
-fn runtime() -> Result<tokio::runtime::Runtime, String> {
-    tokio::runtime::Runtime::new().map_err(|e| format!("创建异步运行时失败: {e}"))
+/// 全局 tokio Runtime 单例。
+///
+/// 旧实现每次网络调用都 `tokio::runtime::Runtime::new()`——一次自动发言等于
+/// 新建一个线程池；叠加反复新建 HTTP 客户端，又添一次连接池分配与 TLS 握手。
+/// 自动模式下每句话都来一遍，界面会明显卡顿。
+fn runtime() -> Result<&'static tokio::runtime::Runtime, String> {
+    static RT: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
+    RT.get_or_init(|| {
+        tokio::runtime::Runtime::new().map_err(|e| format!("创建异步运行时失败: {e}"))
+    })
+    .as_ref()
+    .map_err(|e| e.clone())
+}
+
+/// 全局 reqwest 客户端单例：连接池与 TLS 会话跨请求复用。
+fn http_client() -> &'static reqwest::Client {
+    static C: OnceLock<reqwest::Client> = OnceLock::new();
+    C.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            .timeout(Duration::from_secs(20))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
+// ---------------------------------------------------------------- 异步发送
+
+/// 两次发言之间的最小间隔。弹幕有频率限制，交给 worker 统一节流，
+/// 这样调用方（UI / 自动发言）不必自己 sleep。
+const SEND_MIN_INTERVAL: Duration = Duration::from_millis(300);
+
+struct SendJob {
+    id: u64,
+    text: String,
+}
+
+struct SendQueue {
+    inner: Mutex<VecDeque<SendJob>>,
+    cv: Condvar,
+}
+
+/// 取（并首次创建）网络 worker 线程。发送在独立线程上做，UI 不会被阻塞。
+fn send_queue() -> &'static SendQueue {
+    static Q: OnceLock<&'static SendQueue> = OnceLock::new();
+    Q.get_or_init(|| {
+        let q: &'static SendQueue = Box::leak(Box::new(SendQueue {
+            inner: Mutex::new(VecDeque::new()),
+            cv: Condvar::new(),
+        }));
+        let _ = std::thread::Builder::new()
+            .name("mutsurelay-net".into())
+            .spawn(move || net_loop(q));
+        q
+    })
+}
+
+fn push_send_result(v: serde_json::Value) {
+    if let Ok(mut q) = SEND_RESULTS.lock() {
+        q.push_back(v);
+        while q.len() > 64 {
+            q.pop_front();
+        }
+    }
+}
+
+/// 取走全部已完成的异步发送结果。
+pub fn take_send_results() -> Vec<serde_json::Value> {
+    SEND_RESULTS
+        .lock()
+        .map(|mut q| q.drain(..).collect())
+        .unwrap_or_default()
+}
+
+fn net_loop(q: &'static SendQueue) {
+    loop {
+        let job = {
+            let mut guard = match q.inner.lock() {
+                Ok(g) => g,
+                Err(_) => return,
+            };
+            loop {
+                if let Some(j) = guard.pop_front() {
+                    break j;
+                }
+                guard = match q.cv.wait(guard) {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
+            }
+        };
+        let started = Instant::now();
+        let code = send_message(&job.text);
+        let elapsed = started.elapsed().as_millis() as u64;
+        let item = if code == 0 {
+            serde_json::json!({ "id": job.id, "ok": true, "ms": elapsed })
+        } else {
+            serde_json::json!({
+                "id": job.id,
+                "ok": false,
+                "error": get_last_error(),
+                "ms": elapsed,
+            })
+        };
+        log::debug!("[rust] async send #{} done: code={code} in {elapsed}ms", job.id);
+        push_send_result(item);
+        // 统一节流，避免触发弹幕频率限制
+        std::thread::sleep(SEND_MIN_INTERVAL);
+    }
+}
+
+/// 把一条消息排入异步发送队列，立即返回 job id。
+/// 返回值 <= 0 表示**立即失败**（未登录 / 未连接 / 内容为空），此时不产生 job。
+pub fn enqueue_message(text: &str) -> i64 {
+    let msg = text.trim();
+    if msg.is_empty() {
+        set_last_error("消息为空");
+        return -1;
+    }
+    if get_room_id() == 0 {
+        set_last_error("请先连接直播间");
+        return -1;
+    }
+    let account = Account::from_cookie_string(&current_cookie()).unwrap_or_default();
+    if account.bili_jct.is_empty() {
+        set_last_error("请先登录并连接直播间");
+        return -1;
+    }
+    let id = SEND_SEQ.fetch_add(1, Ordering::SeqCst) + 1;
+    let q = send_queue();
+    if let Ok(mut g) = q.inner.lock() {
+        g.push_back(SendJob {
+            id,
+            text: msg.to_string(),
+        });
+    }
+    q.cv.notify_one();
+    id as i64
 }
 
 fn set_last_error(message: impl Into<String>) {
@@ -209,13 +351,12 @@ pub fn init_from_config(config: &Config) {
     set_language(&config.language);
     set_close_behavior(&config.close_behavior);
     set_subtitle_file_path(&config.subtitle_file_path);
-    set_memory_sensitivity(config.memory_sensitivity);
 }
 
 pub fn generate_qrcode() -> String {
     let result = runtime()
         .and_then(|rt| rt.block_on(async {
-            let response: serde_json::Value = reqwest::Client::new()
+            let response: serde_json::Value = http_client()
                 .get("https://passport.bilibili.com/x/passport-login/web/qrcode/generate")
                 .send()
                 .await
@@ -249,7 +390,7 @@ pub fn check_qrcode_status(key: &str) -> String {
                 "https://passport.bilibili.com/x/passport-login/web/qrcode/poll?qrcode_key={}",
                 key
             );
-            let response = reqwest::Client::new()
+            let response = http_client()
                 .get(&url)
                 .send()
                 .await
@@ -353,11 +494,7 @@ pub fn refresh_user_info() -> Result<(), String> {
     }
     println!("[rust] refresh_user_info: calling Bilibili API");
     runtime()?.block_on(async {
-        let client = reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-            .build()
-            .map_err(|e| format!("创建HTTP客户端失败: {e}"))?;
-        let response = client
+        let response = http_client()
             .get("https://api.bilibili.com/x/web-interface/nav")
             .header(COOKIE, cookie)
             .send()
@@ -429,7 +566,7 @@ pub fn connect_room(room_id: u64) -> i32 {
     let url = format!("https://api.live.bilibili.com/room/v1/Room/room_init?id={}", room_id);
     let ok = runtime()
         .and_then(|rt| rt.block_on(async {
-            let response: serde_json::Value = reqwest::Client::new()
+            let response: serde_json::Value = http_client()
                 .get(&url)
                 .send()
                 .await
@@ -479,7 +616,7 @@ pub fn get_my_room_id() -> i64 {
     let result = runtime()
         .and_then(|rt| rt.block_on(async move {
             let url = format!("https://api.live.bilibili.com/room/v1/Room/getRoomInfoOld?mid={}", mid);
-            let response: serde_json::Value = reqwest::Client::new()
+            let response: serde_json::Value = http_client()
                 .get(&url)
                 .header(COOKIE, current_cookie())
                 .send()
@@ -571,7 +708,7 @@ pub fn send_message(text: &str) -> i32 {
                 ("csrf", account.bili_jct.clone()),
                 ("csrf_token", account.bili_jct),
             ];
-            let response: serde_json::Value = reqwest::Client::new()
+            let response: serde_json::Value = http_client()
                 .post("https://api.live.bilibili.com/msg/send")
                 .header(COOKIE, cookie)
                 .form(&params)
@@ -603,26 +740,25 @@ fn current_cookie() -> String {
     COOKIE_TEXT.lock().map(|c| c.clone()).unwrap_or_default()
 }
 
+/// 把一条字幕追加进字幕文件，保留最后 [`SUBTITLE_TAIL_MAX`] 行。
+///
+/// 旧实现每写一条都先 `read_to_string` 再 `write` 整个文件，磁盘 IO 与文件大小成正比，
+/// 而且发生在解码线程里。现在尾窗常驻内存，每条只做一次定长 `write`。
 pub fn write_subtitle_text(text: &str) {
     let path = SUBTITLE_FILE_PATH.lock().map(|s| s.clone()).unwrap_or_default();
     if path.is_empty() { return; }
 
-    match std::fs::read_to_string(&path) {
-        Ok(content) => {
-            let mut lines: Vec<&str> = content.lines().collect();
-            lines.push(text);
-            if lines.len() > 20 {
-                lines.drain(..lines.len() - 20);
-            }
-            if let Err(e) = std::fs::write(&path, lines.join("\n")) {
-                println!("[rust] failed to write subtitle: {e}");
-            }
-        }
-        Err(_) => {
-            if let Err(e) = std::fs::write(&path, text) {
-                println!("[rust] failed to write subtitle: {e}");
-            }
-        }
+    let mut tail = match SUBTITLE_TAIL.lock() {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    tail.push(text.to_string());
+    if tail.len() > SUBTITLE_TAIL_MAX {
+        let cut = tail.len() - SUBTITLE_TAIL_MAX;
+        tail.drain(..cut);
+    }
+    if let Err(e) = std::fs::write(&path, tail.join("\n")) {
+        log::warn!("[rust] failed to write subtitle: {e}");
     }
 }
 
@@ -630,18 +766,12 @@ pub fn set_subtitle_file_path(path: &str) {
     if let Ok(mut s) = SUBTITLE_FILE_PATH.lock() {
         *s = path.to_string();
     }
+    // 换了目标文件，内存尾窗必须清空，否则会把上一个文件的最后几行带过去
+    if let Ok(mut tail) = SUBTITLE_TAIL.lock() {
+        tail.clear();
+    }
 }
 
 pub fn get_subtitle_file_path() -> String {
     SUBTITLE_FILE_PATH.lock().map(|s| s.clone()).unwrap_or_default()
-}
-
-pub fn set_memory_sensitivity(val: f32) {
-    if let Ok(mut s) = MEMORY_SENSITIVITY.lock() {
-        *s = val.clamp(0.0, 1.0);
-    }
-}
-
-pub fn get_memory_sensitivity() -> f32 {
-    MEMORY_SENSITIVITY.lock().map(|s| *s).unwrap_or(0.5)
 }

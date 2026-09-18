@@ -237,6 +237,14 @@ void main() async {
   final appState = AppState();
   appState.loadSettings();
 
+  // 原生库加载失败会静默退回 mock 模式（能跑但 ASR 不工作），必须让用户看见。
+  final loadErr = NativeBridge.instance.loadError;
+  if (loadErr != null) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      appState.showToast('原生库加载失败，语音识别不可用：$loadErr', ToastType.error);
+    });
+  }
+
   runApp(
     ChangeNotifierProvider.value(
       value: appState,

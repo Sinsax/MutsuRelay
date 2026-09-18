@@ -65,6 +65,9 @@ app.*.map.json
 # FVM Version Cache
 .fvm/
 
+# Local agent workspace (memory/logs, machine-specific)
+/.workbuddy/
+
 # Runtime logs
 error.txt
 

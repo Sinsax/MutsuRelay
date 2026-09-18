@@ -24,6 +24,8 @@ class AppState extends ChangeNotifier {
   bool _isRecording = false;
   bool get isRecording => _isRecording;
   Timer? _recordingPollTimer;
+  // 停止录音后仍继续轮询的剩余次数，用于收 native 侧最后 flush 的一段
+  int _stopGraceTicks = 0;
 
   set isRecording(bool value) {
     if (value == _isRecording) return;
@@ -41,8 +43,10 @@ class AppState extends ChangeNotifier {
       _isRecording = true;
       _startPolling();
     } else {
-      _recordingPollTimer?.cancel();
+      // 不立刻取消轮询：native 侧停止后还会 flush 最后一段，
+      // 留一小段宽限期把尾句收完，否则每次停止都丢最后一句。
       bridge.stopRecording();
+      _stopGraceTicks = 60; // ≈3s
       _liveText = '';
       _audioLevel = 0.0;
       audioLevelNotifier.value = 0.0;
@@ -53,39 +57,65 @@ class AppState extends ChangeNotifier {
 
   void _startPolling() {
     _recordingPollTimer?.cancel();
+    _stopGraceTicks = 0;
     _recordingPollTimer = Timer.periodic(const Duration(milliseconds: 50), (_) {
       final bridge = NativeBridge.instance;
       final poll = bridge.pollRecording();
-      if (poll == null || poll['recording'] != true) {
-        _isRecording = false;
-        _audioLevel = 0.0;
-        audioLevelNotifier.value = 0.0;
-        _liveText = '';
-        _recordingPollTimer?.cancel();
-        notifyListeners();
+      final recording = poll != null && poll['recording'] == true;
+
+      // 无论是否还在录音，都先把 native 产出的结果取走（一次取走整批）。
+      // 此前是单槽覆盖 + 只取一条，一次 flush 含多段时前面的会被丢掉。
+      final results = poll?['results'];
+      if (results is List && results.isNotEmpty) {
+        var got = false;
+        for (final item in results) {
+          if (item is! Map) continue;
+          final text = (item['text'] as String?) ?? '';
+          if (text.isEmpty) continue;
+          if (item['final'] == false) {
+            // interim（实时半句）：只更新预览，不进句列表、不参与自动发言
+            if (_liveText != text) {
+              _liveText = text;
+              got = true;
+            }
+            continue;
+          }
+          addSentence(text);
+          _liveText = '';
+          got = true;
+        }
+        if (got) notifyListeners();
+      }
+
+      if (recording) {
+        final p = poll!;
+        _audioLevel = (p['level'] as num?)?.toDouble() ?? 0.0;
+        audioLevelNotifier.value = _audioLevel;
+        final inSpeech = p['in_speech'] == true;
+        if (inSpeech && _liveText.isEmpty) {
+          _liveText = '...';
+          notifyListeners();
+        } else if (!inSpeech && _liveText.isNotEmpty) {
+          _liveText = '';
+          notifyListeners();
+        }
         return;
       }
-      _audioLevel = (poll['level'] as num?)?.toDouble() ?? 0.0;
-      audioLevelNotifier.value = _audioLevel;
-      var dataChanged = false;
-      final textData = poll['text'];
-      if (textData is Map<String, dynamic>) {
-        final text = textData['text'] as String? ?? '';
-        if (text.isNotEmpty) {
-          addSentence(text);
-          if (_liveText.isNotEmpty) dataChanged = true;
-          _liveText = '';
-        }
+
+      // 已停止：宽限期内继续轮询，等 native 把最后一段 flush 出来
+      if (_stopGraceTicks > 0) {
+        _stopGraceTicks--;
+        return;
       }
-      final inSpeech = poll['in_speech'] == true;
-      if (inSpeech && _liveText.isEmpty) {
-        _liveText = '...';
-        dataChanged = true;
-      } else if (!inSpeech && _liveText == '...') {
-        _liveText = '';
-        dataChanged = true;
-      }
-      if (dataChanged) notifyListeners();
+
+      final err = (poll?['error'] as String?) ?? '';
+      if (err.isNotEmpty) showToast(err, ToastType.error);
+      _isRecording = false;
+      _audioLevel = 0.0;
+      audioLevelNotifier.value = 0.0;
+      _liveText = '';
+      _recordingPollTimer?.cancel();
+      notifyListeners();
     });
   }
 
@@ -327,15 +357,6 @@ class AppState extends ChangeNotifier {
     saveSettings();
   }
 
-  double _memorySensitivity = 0.5;
-  double get memorySensitivity => _memorySensitivity;
-  set memorySensitivity(double value) {
-    _memorySensitivity = value.clamp(0.0, 1.0);
-    NativeBridge.instance.setMemorySensitivity(_memorySensitivity);
-    notifyListeners();
-    saveSettings();
-  }
-
   // QR code
   String _qrCodeUrl = '';
   String get qrCodeUrl => _qrCodeUrl;
@@ -378,18 +399,11 @@ class AppState extends ChangeNotifier {
 
   int _sentenceId = 0;
   int _listGeneration = 0;
-  int _lastFinalTime = 0;
-  String _lastFinalText = '';
 
   int get pendingCount => _sentenceList.where((s) => s.isPending).length;
 
   void addSentence(String text) {
-    final now = DateTime.now().millisecondsSinceEpoch;
-    if (text == _lastFinalText && now - _lastFinalTime < 2000) {
-      return;
-    }
-    _lastFinalText = text;
-    _lastFinalTime = now;
+    // 去重收归 Rust 一层（此前 Rust 3s + Dart 2s 两层，正常复述会被吞）
     final item = SentenceItem(id: ++_sentenceId, text: text);
     _sentenceList.insert(0, item);
     if (_sentenceList.length > 500) {
@@ -416,22 +430,74 @@ class AppState extends ChangeNotifier {
     final text = _sentenceList[idx].text;
     final bridge = NativeBridge.instance;
     final filtered = bridge.censorText(text) ?? text;
-    Future(() {
-      final result = bridge.sendMessage(filtered);
-      if (result != 0) {
-        final err = bridge.getLastError() ?? '';
+    _dispatchSend(id, filtered, bridge);
+  }
+
+  // ---- 异步发送 ----
+  // native 侧有独立的网络线程，并对发言做统一节流（避免触发弹幕频率限制）。
+  // Dart 只负责投递 + 回收结果，不再在 UI 线程上等 HTTP 往返。
+
+  /// jobId → 句列表里的条目 id
+  final Map<int, int> _sendJobs = {};
+  Timer? _sendPollTimer;
+
+  void _dispatchSend(int sentenceId, String text, NativeBridge bridge) {
+    final jobId = bridge.enqueueMessage(text);
+    if (jobId <= 0) {
+      // 立即失败（未登录 / 未连接 / 内容为空）：不会有任务产生
+      final err = bridge.getLastError() ?? '';
+      if (err.isNotEmpty) showToast(err, ToastType.error);
+      final i = _sentenceList.indexWhere((s) => s.id == sentenceId);
+      if (i != -1) {
+        _sentenceList[i].status = SentenceStatus.failed;
+        notifyListeners();
+      }
+      return;
+    }
+    _sendJobs[jobId] = sentenceId;
+    _ensureSendPolling();
+  }
+
+  void _ensureSendPolling() {
+    if (_sendPollTimer != null) return;
+    _sendPollTimer = Timer.periodic(
+      const Duration(milliseconds: 150),
+      (_) => _drainSendResults(),
+    );
+  }
+
+  void _drainSendResults() {
+    final bridge = NativeBridge.instance;
+    final items = bridge.pollSendResults();
+    var changed = false;
+
+    for (final item in items) {
+      if (item is! Map) continue;
+      final jobId = (item['id'] as num?)?.toInt() ?? 0;
+      final sentenceId = _sendJobs.remove(jobId);
+      if (sentenceId == null) continue;
+
+      final ok = item['ok'] == true;
+      final i = _sentenceList.indexWhere((s) => s.id == sentenceId);
+      if (i != -1) {
+        _sentenceList[i].status = ok
+            ? SentenceStatus.success
+            : SentenceStatus.failed;
+        changed = true;
+      }
+      if (!ok) {
+        final err = (item['error'] as String?) ?? '';
         if (err.isNotEmpty) showToast(err, ToastType.error);
       }
-      Future.delayed(Duration(milliseconds: result == 0 ? 300 : 100), () {
-        final i = _sentenceList.indexWhere((s) => s.id == id);
-        if (i != -1) {
-          _sentenceList[i].status = result == 0
-              ? SentenceStatus.success
-              : SentenceStatus.failed;
-          notifyListeners();
-        }
-      });
-    });
+    }
+
+    if (changed) notifyListeners();
+
+    // 队列空了就停掉轮询；下次投递再拉起，避免常驻定时器空转
+    if (_sendJobs.isEmpty && _sendPollTimer != null) {
+      _sendPollTimer!.cancel();
+      _sendPollTimer = null;
+    }
   }
 
   void deleteItem(int id) {
@@ -515,20 +581,7 @@ class AppState extends ChangeNotifier {
 
     final bridge = NativeBridge.instance;
     final filtered = bridge.censorText(msg) ?? msg;
-    Future(() {
-      final result = bridge.sendMessage(filtered);
-      if (result != 0) {
-        final err = bridge.getLastError() ?? '';
-        if (err.isNotEmpty) showToast(err, ToastType.error);
-      }
-      final i = _sentenceList.indexWhere((s) => s.id == id);
-      if (i != -1) {
-        _sentenceList[i].status = result == 0
-            ? SentenceStatus.success
-            : SentenceStatus.failed;
-        notifyListeners();
-      }
-    });
+    _dispatchSend(id, filtered, bridge);
   }
 
   // Toast
@@ -552,13 +605,37 @@ class AppState extends ChangeNotifier {
   // Native bridge integration
   void restartAsr() {
     if (_asrRestarting) return;
+    final bridge = NativeBridge.instance;
+    if (!bridge.isInitialized) {
+      final why = bridge.loadError;
+      showToast(
+        why == null ? '原生库未加载，ASR 不可用' : '原生库未加载：$why',
+        ToastType.error,
+      );
+      return;
+    }
     _asrRestarting = true;
     notifyListeners();
-    final bridge = NativeBridge.instance;
-    Future(() {
-      bridge.initAsr(_modelDir());
+
+    // reload 在 native 的常驻解码线程上完成，这里只是投递 + 轮询结果，
+    // 不再假装"立即成功"（旧实现无条件弹"已重启"，模型缺失时是假的）。
+    bridge.reloadAsr(_modelDir());
+    final deadline = DateTime.now().add(const Duration(seconds: 30));
+    Timer.periodic(const Duration(milliseconds: 200), (t) {
+      final ready = bridge.isAsrReady();
+      final failed = bridge.isAsrFailed();
+      final timedOut = DateTime.now().isAfter(deadline);
+      if (!ready && !failed && !timedOut) return;
+
+      t.cancel();
       _asrRestarting = false;
-      showToast('ASR 已重启', ToastType.info);
+      if (ready) {
+        showToast('ASR 已重启', ToastType.info);
+      } else if (failed) {
+        showToast('ASR 加载失败：请检查模型文件是否完整', ToastType.error);
+      } else {
+        showToast('ASR 重启超时', ToastType.error);
+      }
       notifyListeners();
     });
   }
@@ -671,7 +748,6 @@ class AppState extends ChangeNotifier {
     bridge.setAsrLang(_asrLang);
     bridge.setCloseBehavior(_closeBehavior.name);
     bridge.setSubtitleFilePath(_subtitleFilePath);
-    bridge.setMemorySensitivity(_memorySensitivity);
     bridge.saveConfig();
   }
 
@@ -704,8 +780,6 @@ class AppState extends ChangeNotifier {
         _subtitleFilePath = '$configDir/capture.txt';
         bridge.setSubtitleFilePath(_subtitleFilePath);
       }
-
-      _memorySensitivity = bridge.getMemorySensitivity();
 
       _cookieStatus = bridge.getCookieStatus();
       _isConnected = bridge.isConnected();

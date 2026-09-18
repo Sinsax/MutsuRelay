@@ -1,29 +1,78 @@
+//! MutsuRelay native —— C API 薄层 + 采集链路装配。
+//!
+//! 链路结构（P2 起）：
+//!
+//! ```text
+//! [cpal 回调线程 · 实时]
+//!    单声道下混到预分配 scratch（零分配、零加锁）
+//!    → AudioRing（无锁 SPSC，满则丢最新并计数）
+//!
+//! [capture 线程]  仅持有 cpal stream 的生命周期（创建与销毁必须在同一线程）
+//!
+//! [front-end 线程]
+//!    AudioRing → 抗混叠 + 相位连续的流式重采样
+//!             → 30 ms 分帧 → Segmenter（噪声门 / 分段状态机 / pre-roll 快照）
+//!             → 有界段队列（容量 4，溢出丢最旧）
+//!
+//! [decode 线程 · 常驻]
+//!    recognizer 常驻 → 批量 decode_multiple_streams → TextPipeline（清洗/接缝去重/去重）
+//!    → 敏感词 → 分句 → 字幕 + 结果队列
+//!
+//! [Dart · 50 ms 轮询]  一次取走结果队列全部条目
+//! ```
+
+pub mod asr;
+pub mod audio;
 pub mod bilive;
 pub mod censor;
-pub mod vad;
+pub mod segmenter;
+pub mod text;
 
 use std::ffi::{CStr, CString};
 use std::io::Read;
 use std::os::raw::c_char;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
-use vad::{resample_audio, rms, CONTEXT_SAMPLES, MAX_SEGMENT_SAMPLES, VAD_FRAME_SAMPLES, VAD_MAX_SILENCE_FRAMES, VAD_MIN_SILENCE_FRAMES, VAD_MIN_SPEECH_FRAMES, VAD_HYSTERESIS};
+
+use audio::{StreamResampler, ASR_SAMPLE_RATE};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{StreamConfig, BufferSize};
+use cpal::{BufferSize, StreamConfig};
+use segmenter::{SegmentEvent, Segmenter, SegmenterConfig, VAD_FRAME_SAMPLES};
+
+// ---------------------------------------------------------------- 全局状态
 
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static IS_RECORDING: AtomicBool = AtomicBool::new(false);
+/// 每启动一次录音自增。线程持有自己的 token：token 不匹配即退出，且不再写入任何输出。
+static RUN_TOKEN: AtomicU64 = AtomicU64::new(0);
 static IN_SPEECH: OnceLock<AtomicBool> = OnceLock::new();
 static NOISE_GATE: OnceLock<Mutex<f32>> = OnceLock::new();
 static CENSOR_MODE: OnceLock<Mutex<i32>> = OnceLock::new();
 static NOISE_SUPPRESS: OnceLock<AtomicBool> = OnceLock::new();
 static AUDIO_LEVEL: OnceLock<AtomicU32> = OnceLock::new();
-static RECOGNITION_TEXT: OnceLock<Mutex<String>> = OnceLock::new();
+/// **录音链路自己的**错误（与 B 站接口的 LAST_ERROR 分开，互不污染）。
+static PIPELINE_ERROR: OnceLock<Mutex<String>> = OnceLock::new();
 static MODEL_DIR: OnceLock<Mutex<String>> = OnceLock::new();
 static ASR_LANG: OnceLock<Mutex<String>> = OnceLock::new();
-static LAST_OUTPUT: OnceLock<Mutex<(String, Instant)>> = OnceLock::new();
+/// 段长上限（毫秒），可运行时调整
+static SEGMENT_MAX_MS: AtomicU32 = AtomicU32::new(segmenter::DEFAULT_MAX_SEGMENT_MS);
+/// 是否启用 interim（实时半句）
+static INTERIM_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// 环形缓冲容量：2 秒 @ 48 kHz。
+/// 采集侧一次迭代的实测耗时应 < 5 ms，这里留出 400 倍余量。
+const RING_CAPACITY: usize = 48_000 * 2;
+/// 回调内单声道下混用的 scratch 大小（样本数）
+const CALLBACK_SCRATCH: usize = 16_384;
+/// front-end 单次从环形缓冲取出的上限
+const FRONTEND_READ: usize = 8_192;
+/// interim 节流间隔
+const INTERIM_INTERVAL: Duration = Duration::from_millis(1500);
+/// interim 至少要有这么长的段才值得跑
+const INTERIM_MIN_SEGMENT_MS: u64 = 1500;
 
 fn noise_gate() -> &'static Mutex<f32> {
     NOISE_GATE.get_or_init(|| Mutex::new(0.02))
@@ -40,8 +89,8 @@ fn in_speech_state() -> &'static AtomicBool {
 fn audio_level() -> &'static AtomicU32 {
     AUDIO_LEVEL.get_or_init(|| AtomicU32::new(f32::to_bits(0.0)))
 }
-fn recognition_text() -> &'static Mutex<String> {
-    RECOGNITION_TEXT.get_or_init(|| Mutex::new(String::new()))
+fn pipeline_error() -> &'static Mutex<String> {
+    PIPELINE_ERROR.get_or_init(|| Mutex::new(String::new()))
 }
 fn model_dir() -> &'static Mutex<String> {
     MODEL_DIR.get_or_init(|| Mutex::new(String::new()))
@@ -49,82 +98,447 @@ fn model_dir() -> &'static Mutex<String> {
 fn asr_lang() -> &'static Mutex<String> {
     ASR_LANG.get_or_init(|| Mutex::new("zh".to_string()))
 }
-fn last_output() -> &'static Mutex<(String, Instant)> {
-    LAST_OUTPUT.get_or_init(|| Mutex::new((String::new(), Instant::now())))
+
+fn current_token() -> u64 {
+    RUN_TOKEN.load(Ordering::SeqCst)
 }
 
-const ASR_SAMPLE_RATE: u32 = 16000;
-const SEGMENT_ENERGY_FLOOR: f32 = 0.005;
-const BATCH_MAX_SIZE: usize = 2;
-const BATCH_TIMEOUT_MS: u64 = 120;
-
-struct PendingSegment {
-    context: Vec<f32>,
-    audio: Vec<f32>,
-    queued_at: Instant,
-}
-
-fn find_asr_model() -> Option<(String, String)> {
-    let dir = model_dir().lock().ok()?.clone();
-    if dir.is_empty() { return None; }
-    let model = std::path::Path::new(&dir).join("model.int8.onnx");
-    let tokens = std::path::Path::new(&dir).join("tokens.txt");
-    if model.exists() && tokens.exists() {
-        Some((model.to_string_lossy().to_string(), tokens.to_string_lossy().to_string()))
-    } else {
-        None
+fn set_pipeline_error(message: impl Into<String>) {
+    if let Ok(mut e) = pipeline_error().lock() {
+        *e = message.into();
     }
 }
 
-// ---- C API ----
+fn get_pipeline_error() -> String {
+    pipeline_error().lock().map(|e| e.clone()).unwrap_or_default()
+}
+
+// ---- 装配给解码线程的回调 ----
+
+fn env_censor_mode() -> i32 {
+    censor_mode().lock().map(|m| *m).unwrap_or(0)
+}
+
+fn env_on_final_text(text: &str) {
+    bilive::write_subtitle_text(text);
+}
+
+fn decode_env() -> asr::DecodeEnv {
+    asr::DecodeEnv {
+        current_token,
+        censor_mode: env_censor_mode,
+        on_final_text: env_on_final_text,
+    }
+}
+
+fn engine() -> &'static asr::AsrEngine {
+    asr::engine(decode_env())
+}
+
+/// 让解码线程用当前模型目录 / 语言重建（或首次创建）recognizer。
+/// 线程常驻，所以"重建"发生在后台，界面不会卡；空闲时即等于预热。
+fn trigger_reload() {
+    let dir = model_dir().lock().map(|d| d.clone()).unwrap_or_default();
+    let lang = asr_lang().lock().map(|l| l.clone()).unwrap_or_default();
+    engine().reload(dir, lang);
+}
+
+// ---------------------------------------------------------------- 采集会话
+
+fn start_session() -> u64 {
+    let token = RUN_TOKEN.fetch_add(1, Ordering::SeqCst) + 1;
+    let ring = Arc::new(audio::AudioRing::new(RING_CAPACITY));
+
+    // capture 线程负责设备发现 + stream 生命周期（创建与销毁必须同线程）
+    let (cfg_tx, cfg_rx) = sync_channel::<Result<(u32, u16), String>>(0);
+
+    {
+        let ring = ring.clone();
+        let _ = thread::Builder::new()
+            .name("mutsurelay-capture".into())
+            .spawn(move || capture_owner(token, ring, cfg_tx));
+    }
+    let _ = thread::Builder::new()
+        .name("mutsurelay-frontend".into())
+        .spawn(move || frontend_loop(token, ring, cfg_rx));
+
+    asr::stats().sessions.fetch_add(1, Ordering::Relaxed);
+    token
+}
+
+/// 仅持有 cpal stream 的生命周期；音频数据通过回调写入无锁环形缓冲。
+fn capture_owner(
+    token: u64,
+    ring: Arc<audio::AudioRing>,
+    cfg_tx: std::sync::mpsc::SyncSender<Result<(u32, u16), String>>,
+) {
+    let host = cpal::default_host();
+
+    let devices: Vec<_> = match host.input_devices() {
+        Ok(d) => d.collect(),
+        Err(e) => {
+            let msg = format!("枚举音频输入设备失败: {e}");
+            fail_session(token, &msg);
+            let _ = cfg_tx.send(Err(msg));
+            return;
+        }
+    };
+    if devices.is_empty() {
+        let msg = "未检测到可用的音频输入设备".to_string();
+        fail_session(token, &msg);
+        let _ = cfg_tx.send(Err(msg));
+        return;
+    }
+
+    // 优先麦克风设备，其次是 PipeWire/PulseAudio 兼容名，最后随便挑一个
+    let device = devices
+        .iter()
+        .find(|d| {
+            d.name()
+                .map(|n| {
+                    let nl = n.to_lowercase();
+                    nl.contains("microphone") || nl.contains("mic") || nl.contains("话筒")
+                })
+                .unwrap_or(false)
+        })
+        .or_else(|| {
+            devices.iter().find(|d| {
+                d.name()
+                    .map(|n| {
+                        let nl = n.to_lowercase();
+                        nl == "pulse" || nl == "default" || nl.starts_with("sysdefault")
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .or_else(|| devices.first())
+        .cloned();
+
+    let Some(device) = device else {
+        let msg = "未找到可用的音频输入设备".to_string();
+        fail_session(token, &msg);
+        let _ = cfg_tx.send(Err(msg));
+        return;
+    };
+
+    let config = match device.default_input_config() {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("读取设备默认输入格式失败: {e}");
+            fail_session(token, &msg);
+            let _ = cfg_tx.send(Err(msg));
+            return;
+        }
+    };
+    let channels = config.channels();
+    let input_rate = config.sample_rate().0;
+    log::info!(
+        "[rust] input: {}ch {}Hz ({}) token={}",
+        channels,
+        input_rate,
+        device.name().unwrap_or_default(),
+        token
+    );
+
+    let stream_cfg = StreamConfig {
+        channels,
+        sample_rate: config.sample_rate(),
+        buffer_size: BufferSize::Default,
+    };
+
+    // 预先分配下混 scratch：实时回调里不允许分配
+    let mut scratch: Vec<f32> = vec![0.0; CALLBACK_SCRATCH];
+    let ch = channels as usize;
+    let cb_ring = ring.clone();
+    let err_token = token;
+
+    let stream = match device.build_input_stream(
+        &stream_cfg,
+        move |data: &[f32], _: &cpal::InputCallbackInfo| {
+            // ---- 实时音频线程：零分配、零加锁 ----
+            if !IS_RECORDING.load(Ordering::Relaxed) {
+                return;
+            }
+            let frames = data.len() / ch;
+            let n = frames.min(scratch.len());
+            if ch == 1 {
+                scratch[..n].copy_from_slice(&data[..n]);
+            } else {
+                for i in 0..n {
+                    let mut sum = 0.0f32;
+                    for c in 0..ch {
+                        sum += data[i * ch + c];
+                    }
+                    scratch[i] = sum / ch as f32;
+                }
+            }
+            cb_ring.push_slice(&scratch[..n]);
+        },
+        move |err| {
+            set_pipeline_error(format!("音频流错误: {err}"));
+            if RUN_TOKEN.load(Ordering::SeqCst) == err_token {
+                IS_RECORDING.store(false, Ordering::SeqCst);
+            }
+        },
+        None,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            let msg = format!("无法打开音频输入流: {e}");
+            fail_session(token, &msg);
+            let _ = cfg_tx.send(Err(msg));
+            return;
+        }
+    };
+
+    if let Err(e) = stream.play() {
+        let msg = format!("启动音频流失败: {e}");
+        fail_session(token, &msg);
+        let _ = cfg_tx.send(Err(msg));
+        return;
+    }
+
+    // 把输入格式交给 front-end 线程（配置重采样器）
+    if cfg_tx.send(Ok((input_rate, channels))).is_err() {
+        return;
+    }
+
+    // 只等停止信号，不做任何处理
+    while IS_RECORDING.load(Ordering::SeqCst) && RUN_TOKEN.load(Ordering::SeqCst) == token {
+        thread::sleep(Duration::from_millis(20));
+    }
+    drop(stream);
+    log::info!("[rust] capture stream closed (token={token})");
+}
+
+fn fail_session(token: u64, msg: &str) {
+    log::error!("[rust] capture failed: {msg}");
+    set_pipeline_error(msg.to_string());
+    if RUN_TOKEN.load(Ordering::SeqCst) == token {
+        IS_RECORDING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// front-end 线程：重采样 → 分帧 → 分段 → 投递。
+fn frontend_loop(
+    token: u64,
+    ring: Arc<audio::AudioRing>,
+    cfg_rx: Receiver<Result<(u32, u16), String>>,
+) {
+    let (input_rate, _channels) = match cfg_rx.recv() {
+        Ok(Ok(v)) => v,
+        // 失败信息已由 capture 线程写入 PIPELINE_ERROR
+        Ok(Err(_)) | Err(_) => return,
+    };
+    log::info!(
+        "[rust] front-end started: {}Hz → {}Hz (token={token})",
+        input_rate,
+        ASR_SAMPLE_RATE
+    );
+
+    let mut resampler = StreamResampler::new(input_rate, ASR_SAMPLE_RATE);
+    let mut segmenter = Segmenter::new(SegmenterConfig::default());
+    let mut raw = vec![0.0f32; FRONTEND_READ];
+    let mut resampled: Vec<f32> = Vec::with_capacity(FRONTEND_READ);
+    let mut frame: Vec<f32> = Vec::with_capacity(VAD_FRAME_SAMPLES);
+    let mut leftover: Vec<f32> = Vec::with_capacity(VAD_FRAME_SAMPLES * 2);
+    let mut events: Vec<SegmentEvent> = Vec::with_capacity(8);
+    let mut last_interim = Instant::now();
+    let mut empty_pops = 0u32;
+    segmenter.reset();
+
+    loop {
+        let iter_start = Instant::now();
+        let stopped = !IS_RECORDING.load(Ordering::SeqCst) || RUN_TOKEN.load(Ordering::SeqCst) != token;
+
+        let got = ring.pop_slice(&mut raw);
+        if got == 0 {
+            if stopped {
+                empty_pops += 1;
+                // 连续两次空读才收工，避免漏掉停止瞬间仍在途的最后一块
+                if empty_pops >= 2 {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(3));
+            continue;
+        }
+        empty_pops = 0;
+        asr::stats().captured_chunks.fetch_add(1, Ordering::Relaxed);
+
+        // ---- 重采样（抗混叠 + 跨块相位连续）----
+        resampled.clear();
+        resampler.process(&raw[..got], &mut resampled);
+        if resampled.is_empty() {
+            continue;
+        }
+
+        // 运行时可调的参数每轮刷新一次
+        {
+            let cfg = segmenter.cfg_mut();
+            cfg.gate = noise_gate().lock().map(|g| *g).unwrap_or(0.02);
+            cfg.suppress = noise_suppress().load(Ordering::Relaxed);
+            cfg.max_segment_samples =
+                ASR_SAMPLE_RATE as usize * SEGMENT_MAX_MS.load(Ordering::Relaxed) as usize / 1000;
+        }
+
+        leftover.extend_from_slice(&resampled);
+
+        while leftover.len() >= VAD_FRAME_SAMPLES {
+            frame.clear();
+            frame.extend_from_slice(&leftover[..VAD_FRAME_SAMPLES]);
+            // 用 copy_within 前移，避免 drain 的 O(n) 分支与重复 memmove
+            leftover.copy_within(VAD_FRAME_SAMPLES.., 0);
+            leftover.truncate(leftover.len() - VAD_FRAME_SAMPLES);
+
+            events.clear();
+            let outcome = segmenter.push_frame(&frame, &mut events);
+
+            for ev in events.drain(..) {
+                match ev {
+                    SegmentEvent::Emit(seg) => {
+                        engine().submit_segment(token, *seg);
+                    }
+                    SegmentEvent::Reject { .. } => {
+                        asr::stats().rejected_segments.fetch_add(1, Ordering::Relaxed);
+                    }
+                    SegmentEvent::Start { .. } => {}
+                }
+            }
+
+            audio_level().store(f32::to_bits(outcome.level), Ordering::Relaxed);
+            in_speech_state().store(outcome.in_speech, Ordering::Relaxed);
+        }
+
+        // ---- interim（实时半句）：仅在解码队列空闲时跑，避免抢 CPU ----
+        if INTERIM_ENABLED.load(Ordering::Relaxed)
+            && last_interim.elapsed() >= INTERIM_INTERVAL
+            && segmenter.current_segment_ms() >= INTERIM_MIN_SEGMENT_MS
+            && engine().queue().depth() == 0
+        {
+            if let Some(snap) = segmenter.interim_snapshot() {
+                last_interim = Instant::now();
+                asr::submit_interim(token, snap);
+            }
+        }
+
+        // ---- 采集侧耗时统计：P2 的核心判据 ----
+        let elapsed = iter_start.elapsed().as_millis() as u64;
+        let s = asr::stats();
+        s.frontend.record(elapsed);
+        s.frontend_iter_count.fetch_add(1, Ordering::Relaxed);
+        s.frontend_iter_max_ms.fetch_max(elapsed, Ordering::Relaxed);
+    }
+
+    // ---- 收尾：把进行中的段吐出去，并通知解码线程 ----
+    events.clear();
+    segmenter.flush(&mut events);
+    for ev in events.drain(..) {
+        if let SegmentEvent::Emit(seg) = ev {
+            engine().submit_segment(token, *seg);
+        }
+    }
+    // 只累积"本次会话真正观察到"的环形缓冲丢样
+    asr::stats()
+        .dropped_samples
+        .fetch_add(ring.dropped(), Ordering::Relaxed);
+    engine().flush(token);
+    audio_level().store(f32::to_bits(0.0), Ordering::Relaxed);
+    in_speech_state().store(false, Ordering::Relaxed);
+    log::info!("[rust] front-end stopped (token={token})");
+}
+
+// ---------------------------------------------------------------- C API
+
+/// C API 版本。**增删/改变任何 `mutsurelay_*` 导出符号时必须 +1。**
+///
+/// 用途：本仓库是双系统开发（Linux / Windows 各有一份产物），很容易拿着旧平台的
+/// `.so`/`.dll` 去跑新绑定。没有这个标记时，缺符号会让 `_bindFunctions()` 抛错、
+/// 被 `load()` 吞掉，最后**静默退回 mock 模式**——看起来能跑，其实 ASR 没在工作。
+/// 有了版本号，Dart 侧可以明确报"库太旧，请在当前平台重新构建"。
+pub const ABI_VERSION: u32 = 2;
+
+#[no_mangle]
+pub extern "C" fn mutsurelay_abi_version() -> u32 {
+    ABI_VERSION
+}
 
 #[no_mangle]
 pub extern "C" fn mutsurelay_init(model_dir_ptr: *const c_char) -> i32 {
-    if INITIALIZED.load(Ordering::SeqCst) { return 0; }
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    if INITIALIZED.load(Ordering::SeqCst) {
+        return 0;
+    }
+    let _ = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info"),
+    )
+    .try_init();
     _init_internal(model_dir_ptr)
 }
 
-/// Reinitialize ASR without restarting the full native library.
-/// Called when the user changes the model or ASR language.
+/// 重新初始化 ASR（换模型 / 换语言）。现在会**真正重建** recognizer。
 #[no_mangle]
 pub extern "C" fn mutsurelay_init_asr(model_dir_ptr: *const c_char) -> i32 {
     _init_internal(model_dir_ptr)
 }
 
+/// 与 `mutsurelay_init_asr` 等价，语义更明确的别名。
+#[no_mangle]
+pub extern "C" fn mutsurelay_reload_asr(model_dir_ptr: *const c_char) -> i32 {
+    _init_internal(model_dir_ptr)
+}
+
 fn _init_internal(model_dir_ptr: *const c_char) -> i32 {
-    let dir = if model_dir_ptr.is_null() { String::new() } else { unsafe { CStr::from_ptr(model_dir_ptr) }.to_string_lossy().to_string() };
-    if let Ok(mut m) = model_dir().lock() { *m = dir; }
+    let dir = if model_dir_ptr.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(model_dir_ptr) }
+            .to_string_lossy()
+            .to_string()
+    };
+    if let Ok(mut m) = model_dir().lock() {
+        *m = dir;
+    }
     censor::reload_blocklist();
     if let Ok(cfg) = bilive::Config::load() {
-        if let Ok(mut g) = noise_gate().lock() { *g = cfg.noise_gate; }
-        if let Ok(mut m) = censor_mode().lock() { *m = cfg.censor_mode; }
+        if let Ok(mut g) = noise_gate().lock() {
+            *g = cfg.noise_gate;
+        }
+        if let Ok(mut m) = censor_mode().lock() {
+            *m = cfg.censor_mode;
+        }
         noise_suppress().store(cfg.noise_suppress, Ordering::SeqCst);
         bilive::init_from_config(&cfg);
-        if let Ok(mut a) = asr_lang().lock() { *a = bilive::get_language(); }
+        if let Ok(mut a) = asr_lang().lock() {
+            *a = bilive::get_language();
+        }
     }
+    // 解码线程常驻：这里只是让它换/建 recognizer。放在后台线程里做，
+    // 240 MB 的加载不再砸在首句语音上，也不会卡住调用方。
+    trigger_reload();
     INITIALIZED.store(true, Ordering::SeqCst);
     0
 }
 
 #[no_mangle]
 pub extern "C" fn mutsurelay_shutdown() {
-    if !INITIALIZED.load(Ordering::SeqCst) { return; }
-    if IS_RECORDING.load(Ordering::SeqCst) { mutsurelay_stop_recording(); }
+    if !INITIALIZED.load(Ordering::SeqCst) {
+        return;
+    }
+    if IS_RECORDING.load(Ordering::SeqCst) {
+        mutsurelay_stop_recording();
+    }
     INITIALIZED.store(false, Ordering::SeqCst);
 }
 
 #[no_mangle]
 pub extern "C" fn mutsurelay_start_recording() -> i32 {
-    if IS_RECORDING.load(Ordering::SeqCst) { return 0; }
+    if IS_RECORDING.load(Ordering::SeqCst) {
+        return 0;
+    }
+    set_pipeline_error(String::new());
     IS_RECORDING.store(true, Ordering::SeqCst);
-    thread::spawn(move || {
-        let ok = std::panic::catch_unwind(|| run_recording_pipeline())
-            .ok()
-            .and_then(|r| r)
-            .is_some();
-        if !ok { IS_RECORDING.store(false, Ordering::SeqCst); }
-    });
+    let token = start_session();
+    log::info!("[rust] recording session started (token={token})");
     0
 }
 
@@ -139,467 +553,127 @@ pub extern "C" fn mutsurelay_is_recording() -> i32 {
 }
 
 #[no_mangle]
-pub extern "C" fn mutsurelay_get_audio_level() -> f64 {
-    f32::from_bits(audio_level().load(Ordering::Relaxed)) as f64
+pub extern "C" fn mutsurelay_set_segment_max_ms(ms: u32) {
+    SEGMENT_MAX_MS.store(ms.clamp(1000, 30_000), Ordering::SeqCst);
 }
 
 #[no_mangle]
-pub extern "C" fn mutsurelay_get_recognition_result() -> *mut c_char {
-    let text = recognition_text()
-        .lock()
-        .map(|mut t| std::mem::take(&mut *t))
-        .unwrap_or_default();
-    CString::new(text).unwrap_or_default().into_raw()
+pub extern "C" fn mutsurelay_get_segment_max_ms() -> u32 {
+    SEGMENT_MAX_MS.load(Ordering::SeqCst)
+}
+
+#[no_mangle]
+pub extern "C" fn mutsurelay_set_interim(enabled: i32) {
+    INTERIM_ENABLED.store(enabled != 0, Ordering::SeqCst);
+}
+
+#[no_mangle]
+pub extern "C" fn mutsurelay_get_interim() -> i32 {
+    INTERIM_ENABLED.load(Ordering::SeqCst) as i32
+}
+
+/// recognizer 加载状态：1 = 就绪，0 = 重建中/未尝试，-1 = 加载失败。
+/// reload 在后台线程完成，UI 靠这个接口给用户真实反馈。
+#[no_mangle]
+pub extern "C" fn mutsurelay_asr_state() -> i32 {
+    asr::load_state()
+}
+
+fn stats_json() -> serde_json::Value {
+    let s = asr::stats();
+    let q = asr::result_queue();
+    serde_json::json!({
+        "captured_chunks": s.captured_chunks.load(Ordering::Relaxed),
+        "dropped_samples": s.dropped_samples.load(Ordering::Relaxed),
+        "dropped_segments": s.dropped_segments.load(Ordering::Relaxed),
+        "rejected_segments": s.rejected_segments.load(Ordering::Relaxed),
+        "rejected_text": s.rejected_text.load(Ordering::Relaxed),
+        "seam_trimmed": s.seam_trimmed.load(Ordering::Relaxed),
+        "decoded": s.decoded.load(Ordering::Relaxed),
+        "results": s.results.load(Ordering::Relaxed),
+        // 注意：这个数由 ResultQueue 自己维护。此前读的是 Stats.dropped_results，
+        // 而那个字段从来没被写入过 —— 统计里会永远显示 0（P0 要的"可观测"反而假了）。
+        "dropped_results": q.dropped(),
+        "interim_runs": s.interim_runs.load(Ordering::Relaxed),
+        "interim_results": s.interim_results.load(Ordering::Relaxed),
+        "asr_state": asr::load_state(),
+        "sessions": s.sessions.load(Ordering::Relaxed),
+        "queue_depth": q.len(),
+        "seg_queue_depth": s.seg_queue_depth.load(Ordering::Relaxed),
+        "seg_queue_max": s.seg_queue_max.load(Ordering::Relaxed),
+        "decode_avg_ms": s.decode.avg(),
+        "decode_p50_ms": s.decode.percentile(0.5),
+        "decode_p95_ms": s.decode.percentile(0.95),
+        "decode_max_ms": s.decode.max(),
+        "frontend_avg_ms": s.frontend.avg(),
+        "frontend_p95_ms": s.frontend.percentile(0.95),
+        "frontend_max_ms": s.frontend.max(),
+        "frontend_iters": s.frontend_iter_count.load(Ordering::Relaxed),
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn mutsurelay_get_stats() -> *mut c_char {
+    CString::new(stats_json().to_string())
+        .unwrap_or_default()
+        .into_raw()
 }
 
 #[no_mangle]
 pub extern "C" fn mutsurelay_poll_recording() -> *mut c_char {
     let recording = IS_RECORDING.load(Ordering::SeqCst);
     let level = f32::from_bits(audio_level().load(Ordering::Relaxed)) as f64;
-    let text: serde_json::Value = recognition_text()
-        .lock()
-        .map(|mut t| {
-            let s = std::mem::take(&mut *t);
-            if s.is_empty() {
-                serde_json::Value::Null
-            } else {
-                serde_json::from_str(&s).unwrap_or(serde_json::Value::Null)
-            }
-        })
-        .unwrap_or(serde_json::Value::Null);
-    let in_speech = in_speech_state().load(Ordering::SeqCst);
+    let results = asr::result_queue().drain();
     let json = serde_json::json!({
         "recording": recording,
         "level": level,
-        "text": text,
-        "in_speech": in_speech,
+        "in_speech": in_speech_state().load(Ordering::SeqCst),
+        "error": get_pipeline_error(),
+        "results": results,
+        "stats": stats_json(),
     });
     CString::new(json.to_string()).unwrap_or_default().into_raw()
 }
 
-fn run_recording_pipeline() -> Option<()> {
-    // println!("[rust] run_recording_pipeline: starting");
-
-    let host = cpal::default_host();
-    // println!("[rust] host: {:?}", host.id());
-
-    let devices: Vec<_> = host.input_devices().ok()?.collect();
-    // println!("[rust] input devices: {}", devices.len());
-    // for d in &devices {
-    //     println!("[rust]   device: {:?}", d.name());
-    // }
-
-    // Prefer microphone devices, then PulseAudio/PipeWire compat, then hardware ALSA
-    let device = devices.iter().find(|d| {
-        d.name().map(|n| {
-            let nl = n.to_lowercase();
-            nl.contains("microphone") || nl.contains("mic") || nl.contains("话筒")
-        }).unwrap_or(false)
-    }).or_else(|| {
-        // "pulse" or "default" works reliably on PipeWire via pulse-to-alsa compat
-        devices.iter().find(|d| d.name().map(|n| {
-            let nl = n.to_lowercase();
-            nl == "pulse" || nl == "default" || nl.starts_with("sysdefault")
-        }).unwrap_or(false))
-    }).or_else(|| devices.iter().next())?.clone();
-    // println!("[rust] selected device: {:?}", device.name());
-
-    let config = device.default_input_config().ok()?;
-    let channels = config.channels() as usize;
-    let input_rate = config.sample_rate().0;
-    // println!("[rust] default input config: {}ch, {}Hz", channels, input_rate);
-
-    let stream_cfg = StreamConfig {
-        channels: config.channels(),
-        sample_rate: config.sample_rate(),
-        buffer_size: BufferSize::Default,
-    };
-    // println!("[rust] stream config: {}ch, {}Hz, buffer={:?}",
-    //     stream_cfg.channels, stream_cfg.sample_rate.0, stream_cfg.buffer_size);
-
-    let (tx, rx) = std::sync::mpsc::channel::<Vec<f32>>();
-
-    let stream = device.build_input_stream(
-        &stream_cfg,
-        move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            if IS_RECORDING.load(Ordering::SeqCst) { let _ = tx.send(data.to_vec()); }
-        },
-        |err| println!("[rust] Audio stream error: {err}"),
-        None,
-    );
-    // println!("[rust] build_input_stream: {:?}", stream.is_ok());
-    let stream = stream.ok()?;
-
-    let play_result = stream.play();
-    // println!("[rust] stream.play(): {:?}", play_result);
-    let _ = play_result;
-
-    let mut ring_buf = Vec::with_capacity(CONTEXT_SAMPLES * 2);
-    let mut seg_buf = Vec::with_capacity(MAX_SEGMENT_SAMPLES);
-    let mut frame_buf = Vec::with_capacity(VAD_FRAME_SAMPLES);
-    let mut denoised_buf = Vec::with_capacity(VAD_FRAME_SAMPLES);
-    let mut pending: Vec<PendingSegment> = Vec::with_capacity(BATCH_MAX_SIZE);
-    let mut in_speech = false;
-    let mut consecutive_speech: u32 = 0;
-    let mut max_consecutive_speech: u32 = 0;
-    let mut silence_frames: u32 = 0;
-    let mut leftover = Vec::new();
-    let mut _interim_frame: u32 = 0;
-    let mut noise_raw: f32 = 0.01;
-    let models = find_asr_model();
-
-    // println!("[rust] models found: {:?}", models.is_some());
-
-    let mut recognizer: Option<sherpa_onnx::OfflineRecognizer> = None;
-
-    let mut _frame_count: u64 = 0;
-    // println!("[rust] entering main loop (CONTEXT_SAMPLES={CONTEXT_SAMPLES})");
-    loop {
-        if !IS_RECORDING.load(Ordering::SeqCst) { /* println!("[rust] IS_RECORDING became false, exiting"); */ break; }
-
-        // Flush pending segments on timeout
-        if !pending.is_empty()
-            && pending[0].queued_at.elapsed().as_millis() >= BATCH_TIMEOUT_MS as u128
-        {
-            if let Some(ref r) = recognizer {
-                flush_pending_segments(r, &mut pending);
-            }
-        }
-
-        let chunk: Vec<f32> = match rx.try_recv() {
-            Ok(c) => c,
-            Err(std::sync::mpsc::TryRecvError::Empty) => {
-                thread::sleep(Duration::from_millis(10));
-                continue;
-            }
-            Err(_) => { /* println!("[rust] channel disconnected, exiting"); */ break; }
-        };
-
-        _frame_count += 1;
-
-        // Convert stereo to mono
-        let mono = if channels > 1 {
-            let mut m = Vec::with_capacity(chunk.len() / channels);
-            for i in 0..chunk.len() / channels {
-                let sum: f32 = (0..channels).map(|c| chunk[i * channels + c]).sum();
-                m.push(sum / channels as f32);
-            }
-            m
-        } else {
-            chunk
-        };
-
-        let resampled = resample_audio(&mono, input_rate, ASR_SAMPLE_RATE);
-        if resampled.is_empty() { continue; }
-
-        let mut max_energy: f32 = 0.0;
-
-        // Maintain ring buffer (only last CONTEXT_SAMPLES * 2)
-        ring_buf.extend_from_slice(&resampled);
-        if ring_buf.len() > CONTEXT_SAMPLES * 2 {
-            let excess = ring_buf.len() - CONTEXT_SAMPLES * 2;
-            ring_buf.drain(..excess);
-        }
-
-        leftover.extend_from_slice(&resampled);
-        let threshold = noise_gate().lock().map(|g| *g).unwrap_or(0.01);
-
-        while leftover.len() >= VAD_FRAME_SAMPLES {
-            frame_buf.clear();
-            frame_buf.extend(leftover.drain(..VAD_FRAME_SAMPLES));
-            let raw_energy = rms(&frame_buf);
-
-            // Adaptive noise floor (slower update during speech)
-            let noise_rate = if in_speech { 0.999 } else { 0.92 };
-            noise_raw = noise_raw * noise_rate + raw_energy * (1.0 - noise_rate);
-
-            // Denoising gain (matches Tauri)
-            let signal_ratio = raw_energy / (noise_raw * 1.5).max(0.0001);
-            let suppress = noise_suppress().load(Ordering::SeqCst);
-            let gain = if !suppress {
-                1.0
-            } else if signal_ratio < 0.5 {
-                0.3 + signal_ratio * 0.3
-            } else if signal_ratio < 1.5 {
-                0.45 + (signal_ratio - 0.5) * 0.55
-            } else {
-                1.0
-            };
-            denoised_buf.clear();
-            denoised_buf.extend(frame_buf.iter().map(|s| s * gain));
-            let energy = rms(&denoised_buf);
-            max_energy = max_energy.max(energy);
-
-            let audio_active = if in_speech {
-                energy >= threshold * VAD_HYSTERESIS
-            } else {
-                energy >= threshold
-            };
-
-            if audio_active {
-                if !in_speech {
-                    in_speech = true;
-                    consecutive_speech = 1;
-                    max_consecutive_speech = max_consecutive_speech.max(consecutive_speech);
-                    _interim_frame = 0;
-                } else {
-                    consecutive_speech += 1;
-                    max_consecutive_speech = max_consecutive_speech.max(consecutive_speech);
-                }
-                silence_frames = 0;
-                seg_buf.extend_from_slice(&denoised_buf);
-
-                if recognizer.is_none() && max_consecutive_speech >= VAD_MIN_SPEECH_FRAMES {
-                    recognizer = models.as_ref().and_then(|(model_path, tokens_path)| {
-                        let lang = asr_lang().lock().map(|l| l.clone()).unwrap_or_default();
-                        let mut cfg = sherpa_onnx::OfflineRecognizerConfig::default();
-                        cfg.model_config.sense_voice = sherpa_onnx::OfflineSenseVoiceModelConfig {
-                            model: Some(model_path.clone()),
-                            language: Some(if lang.is_empty() { "auto".to_string() } else { lang }),
-                            use_itn: true,
-                        };
-                        cfg.model_config.tokens = Some(tokens_path.clone());
-                        cfg.decoding_method = Some("greedy_search".to_string());
-                        sherpa_onnx::OfflineRecognizer::create(&cfg)
-                    });
-                }
-                // interim_frame += 1;
-                // if interim_frame >= INTERIM_INTERVAL {
-                //     interim_frame = 0;
-                //     if let Some(ref r) = recognizer { process_segment(&ring_buf, &seg_buf, r, false); }
-                // }
-            } else if in_speech {
-                silence_frames += 1;
-                seg_buf.extend_from_slice(&denoised_buf);
-                max_consecutive_speech = max_consecutive_speech.max(consecutive_speech);
-                consecutive_speech = 0;
-                if silence_frames >= VAD_MIN_SILENCE_FRAMES {
-                    let push_now = max_consecutive_speech >= VAD_MIN_SPEECH_FRAMES || silence_frames >= VAD_MAX_SILENCE_FRAMES;
-                    if push_now {
-                        if max_consecutive_speech >= VAD_MIN_SPEECH_FRAMES {
-                            if rms(&seg_buf) >= SEGMENT_ENERGY_FLOOR {
-                                if recognizer.is_some() {
-                                    let ctx_start = ring_buf.len().saturating_sub(CONTEXT_SAMPLES);
-                                    pending.push(PendingSegment {
-                                        context: ring_buf[ctx_start..].to_vec(),
-                                        audio: seg_buf.clone(),
-                                        queued_at: Instant::now(),
-                                    });
-                                }
-                            }
-                        }
-                        seg_buf.clear();
-                        in_speech = false; consecutive_speech = 0; max_consecutive_speech = 0; silence_frames = 0; _interim_frame = 0;
-                    }
-                }
-            }
-
-            if seg_buf.len() >= MAX_SEGMENT_SAMPLES && in_speech {
-                if max_consecutive_speech >= VAD_MIN_SPEECH_FRAMES {
-                    if rms(&seg_buf) >= SEGMENT_ENERGY_FLOOR {
-                        if recognizer.is_some() {
-                            let ctx_start = ring_buf.len().saturating_sub(CONTEXT_SAMPLES);
-                            pending.push(PendingSegment {
-                                context: ring_buf[ctx_start..].to_vec(),
-                                audio: seg_buf.clone(),
-                                queued_at: Instant::now(),
-                            });
-                        }
-                    }
-                }
-                seg_buf.clear();
-                in_speech = false; consecutive_speech = 0; max_consecutive_speech = 0; silence_frames = 0; _interim_frame = 0;
-        }
-
-        // Flush if batch is full
-        if pending.len() >= BATCH_MAX_SIZE {
-            if let Some(ref r) = recognizer {
-                flush_pending_segments(r, &mut pending);
-            }
-        }
-
-        audio_level().store(f32::to_bits((max_energy * 10.0).min(1.0)), Ordering::Relaxed);
-        in_speech_state().store(in_speech, Ordering::Relaxed);
-
-        // if frame_count % 100 == 0 {
-        //     println!("[rust] frame {}: in_speech={in_speech}, energy={energy:.4}, threshold={threshold:.4}, noise_floor={:.4}", frame_count, noise_raw * 1.5);
-        // }
-        }
-    }
-
-    max_consecutive_speech = max_consecutive_speech.max(consecutive_speech);
-    if in_speech && max_consecutive_speech >= VAD_MIN_SPEECH_FRAMES {
-        if rms(&seg_buf) >= SEGMENT_ENERGY_FLOOR {
-            if recognizer.is_some() {
-                let ctx_start = ring_buf.len().saturating_sub(CONTEXT_SAMPLES);
-                pending.push(PendingSegment {
-                    context: ring_buf[ctx_start..].to_vec(),
-                    audio: seg_buf.clone(),
-                    queued_at: Instant::now(),
-                });
-            }
-        }
-    }
-    if let Some(ref r) = recognizer {
-        flush_pending_segments(r, &mut pending);
-    }
-    Some(())
-}
-
-fn is_repetitive(text: &str) -> bool {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() < 4 { return false; }
-    let mut max_count = 0u32;
-    let mut seen: Vec<(char, u32)> = Vec::new();
-    for &c in &chars {
-        if let Some(pos) = seen.iter().position(|&(ch, _)| ch == c) {
-            seen[pos].1 += 1;
-            if seen[pos].1 > max_count { max_count = seen[pos].1; }
-        } else {
-            seen.push((c, 1));
-            if 1 > max_count { max_count = 1; }
-        }
-    }
-    max_count as f32 / chars.len() as f32 > 0.55
-}
-
-fn split_sentence(text: &str) -> Vec<String> {
-    const SPLIT_MAX_LEN: usize = 15;
-    if text.chars().count() <= SPLIT_MAX_LEN {
-        return vec![text.to_string()];
-    }
-
-    let strong: &[char] = &['。', '！', '？', '\n'];
-    let soft: &[char] = &['，', '；', '、', '：', '）', '」', '』', '"'];
-    let particles: &[char] = &['的', '了', '在', '是', '我', '有', '和', '就', '不', '人'];
-
-    let chars: Vec<char> = text.chars().collect();
-    let mut parts: Vec<String> = Vec::new();
-    let mut start = 0;
-
-    while start < chars.len() {
-        let remaining = chars.len() - start;
-        if remaining <= SPLIT_MAX_LEN {
-            parts.push(chars[start..].iter().collect());
-            break;
-        }
-
-        let search_end = (start + SPLIT_MAX_LEN).min(chars.len());
-        let mut best = search_end;
-
-        if let Some(pos) = chars[start..search_end].iter().rposition(|c| strong.contains(c)) {
-            best = start + pos + 1;
-        } else if let Some(pos) = chars[start..search_end].iter().rposition(|c| soft.contains(c)) {
-            best = start + pos + 1;
-        } else {
-            let third = start + (search_end - start) * 2 / 3;
-            if let Some(pos) = chars[third..search_end].iter().rposition(|c| particles.contains(c)) {
-                best = third + pos + 1;
-            }
-        }
-
-        parts.push(chars[start..best].iter().collect());
-        start = best;
-
-        while start < chars.len() && (chars[start].is_whitespace() || matches!(chars[start], ' ' | '　' | '、')) {
-            start += 1;
-        }
-    }
-
-    parts
-}
-
-fn process_stream_result(stream: &sherpa_onnx::OfflineStream, is_final: bool) {
-    let text = stream.get_result().map(|r| r.text).unwrap_or_default();
-    if text.trim().is_empty() { return; }
-
-    let raw_chars: Vec<char> = text.chars().collect();
-    let mut cleaned = String::with_capacity(text.len());
-    for i in 0..raw_chars.len() {
-        if raw_chars[i] == ' ' && i > 0 && i + 1 < raw_chars.len()
-            && raw_chars[i - 1] >= '\u{4e00}' && raw_chars[i - 1] <= '\u{9fff}'
-            && raw_chars[i + 1] >= '\u{4e00}' && raw_chars[i + 1] <= '\u{9fff}'
-        {
-            continue;
-        }
-        cleaned.push(raw_chars[i]);
-    }
-    let final_text = cleaned.trim_matches(|c: char| {
-        c == '，' || c == '。' || c == '、' || c == '！' || c == '？'
-        || c == '：' || c == '；' || c == '…' || c == '—' || c == '·'
-        || c == ' ' || c == '.' || c == ','
-    }).to_string();
-    if final_text.is_empty() { return; }
-
-    let chars_only: String = final_text.chars().filter(|c| {
-        !c.is_ascii_punctuation() && !"。，！？；、：…—·".contains(*c)
-    }).collect();
-    if !is_final {
-        if chars_only.len() < 2 { return; }
-        if is_repetitive(&chars_only) { return; }
-    } else {
-        if chars_only.len() < 2 { return; }
-        if is_repetitive(&final_text) { return; }
-        {
-            let mut last = last_output().lock().unwrap();
-            if last.0 == final_text && last.1.elapsed().as_secs() < 3 {
-                return;
-            }
-            last.0 = final_text.clone();
-            last.1 = Instant::now();
-        }
-    }
-
-    let filtered = {
-        let mode = censor_mode().lock().map(|m| *m).unwrap_or(0);
-        if mode > 0 { censor::censor(&final_text, mode) } else { final_text.clone() }
-    };
-
-    if is_final {
-        for sentence in split_sentence(&filtered) {
-            bilive::write_subtitle_text(&sentence);
-        }
-    }
-    let tag = if is_final { "final" } else { "interim" };
-    let json = serde_json::json!({"type": tag, "text": filtered}).to_string();
-    if let Ok(mut r) = recognition_text().lock() {
-        *r = json;
-    }
-}
-
-fn flush_pending_segments(recognizer: &sherpa_onnx::OfflineRecognizer, pending: &mut Vec<PendingSegment>) {
-    if pending.is_empty() { return; }
-
-    let streams: Vec<_> = pending.iter().map(|seg| {
-        let stream = recognizer.create_stream();
-        stream.accept_waveform(ASR_SAMPLE_RATE as i32, &seg.context);
-        stream.accept_waveform(ASR_SAMPLE_RATE as i32, &seg.audio);
-        stream
-    }).collect();
-
-    let stream_refs: Vec<_> = streams.iter().collect();
-    recognizer.decode_multiple_streams(&stream_refs);
-
-    for stream in &streams {
-        process_stream_result(stream, true);
-    }
-    pending.clear();
-}
-
-// ---- Model download ----
+// ---- 模型下载 ----
 
 #[no_mangle]
-pub extern "C" fn mutsurelay_download_asr_model(url: *const c_char, dest_dir: *const c_char) -> i32 {
-    let url_s = if url.is_null() { return -1; } else { unsafe { CStr::from_ptr(url) }.to_string_lossy().to_string() };
-    let dir_s = if dest_dir.is_null() { return -1; } else { unsafe { CStr::from_ptr(dest_dir) }.to_string_lossy().to_string() };
+pub extern "C" fn mutsurelay_download_asr_model(
+    url: *const c_char,
+    dest_dir: *const c_char,
+) -> i32 {
+    let url_s = if url.is_null() {
+        return -1;
+    } else {
+        unsafe { CStr::from_ptr(url) }.to_string_lossy().to_string()
+    };
+    let dir_s = if dest_dir.is_null() {
+        return -1;
+    } else {
+        unsafe { CStr::from_ptr(dest_dir) }
+            .to_string_lossy()
+            .to_string()
+    };
     log::info!("Downloading ASR model from {url_s}");
 
-    let body = match ureq::get(&url_s).call().map_err(|e| format!("{e}")).and_then(|r| {
-        let mut buf = Vec::new();
-        r.into_reader().read_to_end(&mut buf).map(|_| buf).map_err(|e| format!("{e}"))
-    }) {
-        Ok(b) => { log::info!("Downloaded {} bytes", b.len()); b }
-        Err(e) => { log::error!("Download failed: {e}"); return -1; }
+    let body = match ureq::get(&url_s)
+        .call()
+        .map_err(|e| format!("{e}"))
+        .and_then(|r| {
+            let mut buf = Vec::new();
+            r.into_reader()
+                .read_to_end(&mut buf)
+                .map(|_| buf)
+                .map_err(|e| format!("{e}"))
+        }) {
+        Ok(b) => {
+            log::info!("Downloaded {} bytes", b.len());
+            b
+        }
+        Err(e) => {
+            log::error!("Download failed: {e}");
+            return -1;
+        }
     };
 
     let bz = bzip2::read::MultiBzDecoder::new(&body[..]);
@@ -609,24 +683,27 @@ pub extern "C" fn mutsurelay_download_asr_model(url: *const c_char, dest_dir: *c
         return -1;
     }
 
-    // Check that the extracted files exist
     let dir_path = std::path::Path::new(&dir_s);
     let has_model = dir_path.join("model.int8.onnx").exists();
     let has_tokens = dir_path.join("tokens.txt").exists();
     log::info!("Extracted to {dir_s}, model={has_model} tokens={has_tokens}");
+    // 新模型就位后让解码线程换上去
+    trigger_reload();
     0
 }
 
-// ---- VAD / Noise Gate ----
+// ---- VAD / 噪声门 ----
 
 #[no_mangle]
 pub extern "C" fn mutsurelay_set_noise_gate(gate: f64) {
-    if let Ok(mut g) = noise_gate().lock() { *g = gate as f32; }
+    if let Ok(mut g) = noise_gate().lock() {
+        *g = gate as f32;
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn mutsurelay_get_noise_gate() -> f64 {
-    noise_gate().lock().map(|g| *g as f64).unwrap_or(0.01)
+    noise_gate().lock().map(|g| *g as f64).unwrap_or(0.02)
 }
 
 #[no_mangle]
@@ -639,11 +716,13 @@ pub extern "C" fn mutsurelay_get_noise_suppress() -> i32 {
     noise_suppress().load(Ordering::SeqCst) as i32
 }
 
-// ---- Censor ----
+// ---- 敏感词 ----
 
 #[no_mangle]
 pub extern "C" fn mutsurelay_set_censor_mode(mode: i32) {
-    if let Ok(mut m) = censor_mode().lock() { *m = mode; }
+    if let Ok(mut m) = censor_mode().lock() {
+        *m = mode;
+    }
 }
 
 #[no_mangle]
@@ -653,71 +732,121 @@ pub extern "C" fn mutsurelay_get_censor_mode() -> i32 {
 
 #[no_mangle]
 pub extern "C" fn mutsurelay_censor_text(input: *const c_char) -> *mut c_char {
-    let text = if input.is_null() { String::new() } else { unsafe { CStr::from_ptr(input) }.to_string_lossy().to_string() };
+    let text = if input.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(input) }.to_string_lossy().to_string()
+    };
     let mode = censor_mode().lock().map(|m| *m).unwrap_or(0);
-    let result = if mode > 0 { censor::censor(&text, mode) } else { text };
+    let result = if mode > 0 {
+        censor::censor(&text, mode)
+    } else {
+        text
+    };
     CString::new(result).unwrap_or_default().into_raw()
 }
 
 #[no_mangle]
 pub extern "C" fn mutsurelay_free_string(s: *mut c_char) {
-    if !s.is_null() { unsafe { drop(CString::from_raw(s)); } }
+    if !s.is_null() {
+        unsafe { drop(CString::from_raw(s)) };
+    }
 }
 
-// ---- Bilibili ----
+// ---- B 站 ----
 
 #[no_mangle]
 pub extern "C" fn mutsurelay_generate_qrcode() -> *mut c_char {
-    CString::new(bilive::generate_qrcode()).unwrap_or_default().into_raw()
+    CString::new(bilive::generate_qrcode())
+        .unwrap_or_default()
+        .into_raw()
 }
 
 #[no_mangle]
 pub extern "C" fn mutsurelay_check_qrcode_status(key: *const c_char) -> *mut c_char {
-    let k = if key.is_null() { String::new() } else { unsafe { CStr::from_ptr(key) }.to_string_lossy().to_string() };
-    CString::new(bilive::check_qrcode_status(&k)).unwrap_or_default().into_raw()
+    let k = if key.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(key) }.to_string_lossy().to_string()
+    };
+    CString::new(bilive::check_qrcode_status(&k))
+        .unwrap_or_default()
+        .into_raw()
 }
 
 #[no_mangle]
 pub extern "C" fn mutsurelay_set_cookie(cookie: *const c_char) -> i32 {
-    let c = if cookie.is_null() { return -1; } else { unsafe { CStr::from_ptr(cookie) }.to_string_lossy().to_string() };
+    let c = if cookie.is_null() {
+        return -1;
+    } else {
+        unsafe { CStr::from_ptr(cookie) }
+            .to_string_lossy()
+            .to_string()
+    };
     bilive::set_cookie(&c)
 }
 
 #[no_mangle]
 pub extern "C" fn mutsurelay_get_account_info() -> *mut c_char {
     let info = bilive::get_account_info();
-    CString::new(serde_json::to_string(&info).unwrap_or_else(|_| "{}".to_string())).unwrap_or_default().into_raw()
+    CString::new(serde_json::to_string(&info).unwrap_or_else(|_| "{}".to_string()))
+        .unwrap_or_default()
+        .into_raw()
 }
 
 #[no_mangle]
-pub extern "C" fn mutsurelay_get_cookie_status() -> i32 { bilive::get_cookie_status() as i32 }
+pub extern "C" fn mutsurelay_get_cookie_status() -> i32 {
+    bilive::get_cookie_status() as i32
+}
 
 #[no_mangle]
-pub extern "C" fn mutsurelay_logout() { bilive::logout(); }
+pub extern "C" fn mutsurelay_logout() {
+    bilive::logout();
+}
 
 #[no_mangle]
-pub extern "C" fn mutsurelay_connect_room(room_id: i64) -> i32 { bilive::connect_room(room_id as u64) }
+pub extern "C" fn mutsurelay_connect_room(room_id: i64) -> i32 {
+    bilive::connect_room(room_id as u64)
+}
 
 #[no_mangle]
-pub extern "C" fn mutsurelay_disconnect_room() { bilive::disconnect_room(); }
+pub extern "C" fn mutsurelay_disconnect_room() {
+    bilive::disconnect_room();
+}
 
 #[no_mangle]
-pub extern "C" fn mutsurelay_is_connected() -> i32 { bilive::is_connected() as i32 }
+pub extern "C" fn mutsurelay_is_connected() -> i32 {
+    bilive::is_connected() as i32
+}
 
 #[no_mangle]
-pub extern "C" fn mutsurelay_set_room_id(room_id: i64) { bilive::set_room_id(room_id as u64); }
+pub extern "C" fn mutsurelay_set_room_id(room_id: i64) {
+    bilive::set_room_id(room_id as u64);
+}
 
 #[no_mangle]
-pub extern "C" fn mutsurelay_get_my_room_id() -> i64 { bilive::get_my_room_id() }
+pub extern "C" fn mutsurelay_get_my_room_id() -> i64 {
+    bilive::get_my_room_id()
+}
 
 #[no_mangle]
-pub extern "C" fn mutsurelay_get_room_id() -> i64 { bilive::get_room_id() as i64 }
+pub extern "C" fn mutsurelay_get_room_id() -> i64 {
+    bilive::get_room_id() as i64
+}
 
 #[no_mangle]
 pub extern "C" fn mutsurelay_set_asr_lang(lang: *const c_char) {
-    let l = if lang.is_null() { "auto".to_string() } else { unsafe { CStr::from_ptr(lang) }.to_string_lossy().to_string() };
-    if let Ok(mut a) = asr_lang().lock() { *a = l.clone(); }
+    let l = if lang.is_null() {
+        "auto".to_string()
+    } else {
+        unsafe { CStr::from_ptr(lang) }.to_string_lossy().to_string()
+    };
+    if let Ok(mut a) = asr_lang().lock() {
+        *a = l.clone();
+    }
+    // 语言是 recognizer 的构造参数，改了必须重建才生效
     bilive::set_language(&l);
+    trigger_reload();
 }
 
 #[no_mangle]
@@ -728,24 +857,59 @@ pub extern "C" fn mutsurelay_get_asr_lang() -> *mut c_char {
 
 #[no_mangle]
 pub extern "C" fn mutsurelay_set_close_behavior(behavior: *const c_char) {
-    let b = if behavior.is_null() { "hide".to_string() } else { unsafe { CStr::from_ptr(behavior) }.to_string_lossy().to_string() };
+    let b = if behavior.is_null() {
+        "hide".to_string()
+    } else {
+        unsafe { CStr::from_ptr(behavior) }
+            .to_string_lossy()
+            .to_string()
+    };
     bilive::set_close_behavior(&b);
 }
 
 #[no_mangle]
 pub extern "C" fn mutsurelay_get_close_behavior() -> *mut c_char {
-    CString::new(bilive::get_close_behavior()).unwrap_or_default().into_raw()
+    CString::new(bilive::get_close_behavior())
+        .unwrap_or_default()
+        .into_raw()
+}
+
+/// 同步发送（手动发送用；会阻塞调用线程直到 HTTP 往返完成）。
+#[no_mangle]
+pub extern "C" fn mutsurelay_send_message(text: *const c_char) -> i32 {
+    let t = if text.is_null() {
+        return -1;
+    } else {
+        unsafe { CStr::from_ptr(text) }.to_string_lossy().to_string()
+    };
+    bilive::send_message(&t)
+}
+
+/// 异步入队发送（自动发言 / UI 用）。立即返回 job id，结果通过
+/// `mutsurelay_poll_send_results` 取回。调用方线程不会被网络阻塞。
+#[no_mangle]
+pub extern "C" fn mutsurelay_enqueue_message(text: *const c_char) -> i64 {
+    let t = if text.is_null() {
+        return -1;
+    } else {
+        unsafe { CStr::from_ptr(text) }.to_string_lossy().to_string()
+    };
+    bilive::enqueue_message(&t)
 }
 
 #[no_mangle]
-pub extern "C" fn mutsurelay_send_message(text: *const c_char) -> i32 {
-    let t = if text.is_null() { return -1; } else { unsafe { CStr::from_ptr(text) }.to_string_lossy().to_string() };
-    bilive::send_message(&t)
+pub extern "C" fn mutsurelay_poll_send_results() -> *mut c_char {
+    let items = bilive::take_send_results();
+    CString::new(serde_json::Value::Array(items).to_string())
+        .unwrap_or_default()
+        .into_raw()
 }
 
 #[no_mangle]
 pub extern "C" fn mutsurelay_get_config_dir_path() -> *mut c_char {
-    CString::new(bilive::get_storage_dir().to_string_lossy().to_string()).unwrap_or_default().into_raw()
+    CString::new(bilive::get_storage_dir().to_string_lossy().to_string())
+        .unwrap_or_default()
+        .into_raw()
 }
 
 #[no_mangle]
@@ -755,38 +919,33 @@ pub extern "C" fn mutsurelay_get_last_error() -> *mut c_char {
 
 #[no_mangle]
 pub extern "C" fn mutsurelay_set_subtitle_file_path(path: *const c_char) {
-    let p = if path.is_null() { String::new() } else { unsafe { CStr::from_ptr(path) }.to_string_lossy().to_string() };
+    let p = if path.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(path) }.to_string_lossy().to_string()
+    };
     bilive::set_subtitle_file_path(&p);
 }
 
 #[no_mangle]
 pub extern "C" fn mutsurelay_get_subtitle_file_path() -> *mut c_char {
-    CString::new(bilive::get_subtitle_file_path()).unwrap_or_default().into_raw()
+    CString::new(bilive::get_subtitle_file_path())
+        .unwrap_or_default()
+        .into_raw()
 }
 
-#[no_mangle]
-pub extern "C" fn mutsurelay_set_memory_sensitivity(val: f64) {
-    bilive::set_memory_sensitivity(val as f32);
-}
-
-#[no_mangle]
-pub extern "C" fn mutsurelay_get_memory_sensitivity() -> f64 {
-    bilive::get_memory_sensitivity() as f64
-}
-
-// ---- Config persistence ----
+// ---- 配置持久化 ----
 
 #[no_mangle]
 pub extern "C" fn mutsurelay_save_config() -> i32 {
     let mut cfg = bilive::Config::load().unwrap_or_default();
     cfg.roomid = bilive::get_room_id();
-    cfg.noise_gate = noise_gate().lock().map(|g| *g).unwrap_or(0.01);
+    cfg.noise_gate = noise_gate().lock().map(|g| *g).unwrap_or(0.02);
     cfg.censor_mode = censor_mode().lock().map(|m| *m).unwrap_or(0);
     cfg.noise_suppress = noise_suppress().load(Ordering::SeqCst);
     cfg.language = bilive::get_language();
     cfg.close_behavior = bilive::get_close_behavior();
     cfg.subtitle_file_path = bilive::get_subtitle_file_path();
-    cfg.memory_sensitivity = bilive::get_memory_sensitivity();
     cfg.save().map(|_| 0).unwrap_or(-1)
 }
 
@@ -794,16 +953,24 @@ pub extern "C" fn mutsurelay_save_config() -> i32 {
 pub extern "C" fn mutsurelay_load_config() -> i32 {
     match bilive::Config::load() {
         Ok(cfg) => {
-            if let Ok(mut g) = noise_gate().lock() { *g = cfg.noise_gate; }
-            if let Ok(mut m) = censor_mode().lock() { *m = cfg.censor_mode; }
+            if let Ok(mut g) = noise_gate().lock() {
+                *g = cfg.noise_gate;
+            }
+            if let Ok(mut m) = censor_mode().lock() {
+                *m = cfg.censor_mode;
+            }
             noise_suppress().store(cfg.noise_suppress, Ordering::SeqCst);
             bilive::set_language(&cfg.language);
             bilive::set_close_behavior(&cfg.close_behavior);
-            if cfg.roomid > 0 { bilive::set_room_id(cfg.roomid); }
+            if cfg.roomid > 0 {
+                bilive::set_room_id(cfg.roomid);
+            }
             bilive::set_subtitle_file_path(&cfg.subtitle_file_path);
-            bilive::set_memory_sensitivity(cfg.memory_sensitivity);
             bilive::init_from_config(&cfg);
-            if let Ok(mut a) = asr_lang().lock() { *a = bilive::get_language(); }
+            if let Ok(mut a) = asr_lang().lock() {
+                *a = bilive::get_language();
+            }
+            trigger_reload();
             0
         }
         Err(_) => -1,

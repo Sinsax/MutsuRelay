@@ -88,9 +88,6 @@ typedef MutsuRelaySetAsrLangDart = void Function(Pointer<Utf8> lang);
 typedef MutsuRelaySetCloseBehaviorC = Void Function(Pointer<Utf8> behavior);
 typedef MutsuRelaySetCloseBehaviorDart = void Function(Pointer<Utf8> behavior);
 
-typedef MutsuRelaySendMessageC = Int32 Function(Pointer<Utf8> text);
-typedef MutsuRelaySendMessageDart = int Function(Pointer<Utf8> text);
-
 typedef MutsuRelayGetConfigDirPathC = Pointer<Utf8> Function();
 typedef MutsuRelayGetConfigDirPathDart = Pointer<Utf8> Function();
 
@@ -112,12 +109,6 @@ typedef MutsuRelaySaveConfigDart = int Function();
 typedef MutsuRelayLoadConfigC = Int32 Function();
 typedef MutsuRelayLoadConfigDart = int Function();
 
-typedef MutsuRelayGetAudioLevelC = Double Function();
-typedef MutsuRelayGetAudioLevelDart = double Function();
-
-typedef MutsuRelayGetRecognitionResultC = Pointer<Utf8> Function();
-typedef MutsuRelayGetRecognitionResultDart = Pointer<Utf8> Function();
-
 typedef MutsuRelayPollRecordingC = Pointer<Utf8> Function();
 typedef MutsuRelayPollRecordingDart = Pointer<Utf8> Function();
 
@@ -130,11 +121,34 @@ typedef MutsuRelaySetSubtitleFilePathDart = void Function(Pointer<Utf8> path);
 typedef MutsuRelayGetSubtitleFilePathC = Pointer<Utf8> Function();
 typedef MutsuRelayGetSubtitleFilePathDart = Pointer<Utf8> Function();
 
-typedef MutsuRelaySetMemorySensitivityC = Void Function(Double val);
-typedef MutsuRelaySetMemorySensitivityDart = void Function(double val);
+// ---- P2/P3: 常驻解码线程 / 分段参数 / 异步发送 / 运行统计 ----
 
-typedef MutsuRelayGetMemorySensitivityC = Double Function();
-typedef MutsuRelayGetMemorySensitivityDart = double Function();
+typedef MutsuRelayReloadAsrC = Int32 Function(Pointer<Utf8> modelDir);
+typedef MutsuRelayReloadAsrDart = int Function(Pointer<Utf8> modelDir);
+
+typedef MutsuRelaySetSegmentMaxMsC = Void Function(Uint32 ms);
+typedef MutsuRelaySetSegmentMaxMsDart = void Function(int ms);
+
+typedef MutsuRelayGetSegmentMaxMsC = Uint32 Function();
+typedef MutsuRelayGetSegmentMaxMsDart = int Function();
+
+typedef MutsuRelaySetInterimC = Void Function(Int32 enabled);
+typedef MutsuRelaySetInterimDart = void Function(int enabled);
+
+typedef MutsuRelayGetInterimC = Int32 Function();
+typedef MutsuRelayGetInterimDart = int Function();
+
+typedef MutsuRelayEnqueueMessageC = Int64 Function(Pointer<Utf8> text);
+typedef MutsuRelayEnqueueMessageDart = int Function(Pointer<Utf8> text);
+
+typedef MutsuRelayPollSendResultsC = Pointer<Utf8> Function();
+typedef MutsuRelayPollSendResultsDart = Pointer<Utf8> Function();
+
+typedef MutsuRelayGetStatsC = Pointer<Utf8> Function();
+typedef MutsuRelayGetStatsDart = Pointer<Utf8> Function();
+
+typedef MutsuRelayAsrStateC = Int32 Function();
+typedef MutsuRelayAsrStateDart = int Function();
 
 // ---- Native Bridge ----
 
@@ -142,6 +156,7 @@ class NativeBridge {
   static NativeBridge? _instance;
   late final DynamicLibrary _lib;
   bool _initialized = false;
+  String? _loadError;
 
   NativeBridge._();
 
@@ -152,12 +167,20 @@ class NativeBridge {
 
   bool get isInitialized => _initialized;
 
+  /// 加载失败的原因（未加载时为 null）。`load()` 失败会**静默退回 mock**，
+  /// 这个字段就是让"静默"变得可诊断的出口。
+  String? get loadError => _loadError;
+
+  /// 与 native 侧 `ABI_VERSION` 保持一致。改动任何 `mutsurelay_*` 符号都要同时改两处。
+  static const int expectedAbiVersion = 2;
+
   /// Load the native library. Must be called before any other operation.
   void load({String? libraryPath}) {
     if (_initialized) return;
 
     final path = libraryPath ?? _defaultLibraryPath();
     if (path == null) {
+      _loadError = '未找到原生库文件';
       log('Native library path not found, running in mock mode');
       return;
     }
@@ -174,11 +197,39 @@ class NativeBridge {
         }
       }
       _lib = DynamicLibrary.open(path);
+
+      // 版本先于绑定检查：符号缺失时 _bindFunctions() 会抛错并被下面的 catch
+      // 吞成 mock 模式，只有这里能说清"为什么"。
+      final abi = _readAbiVersion();
+      if (abi != expectedAbiVersion) {
+        throw StateError(
+          abi == null
+              ? '原生库缺少 mutsurelay_abi_version：这是旧版本产物，'
+                    '请在本平台重新构建（native/build.ps1 或 native/build.sh）'
+              : '原生库 ABI 版本 $abi 与绑定所需 $expectedAbiVersion 不符，'
+                    '请在本平台重新构建原生库',
+        );
+      }
+
       _bindFunctions();
       _initialized = true;
-      log('Native library loaded: $path');
+      _loadError = null;
+      log('Native library loaded: $path (abi $abi)');
     } catch (e) {
+      // 不清空 _loadError：调用方据此提示用户，而不是让 ASR 静默失效
+      _loadError = '$e';
       log('Failed to load native library: $e, running in mock mode');
+    }
+  }
+
+  int? _readAbiVersion() {
+    try {
+      final fn = _lib.lookupFunction<Uint32 Function(), int Function()>(
+        'mutsurelay_abi_version',
+      );
+      return fn();
+    } catch (_) {
+      return null;
     }
   }
 
@@ -247,21 +298,25 @@ class NativeBridge {
   late MutsuRelayGetMyRoomIdDart _getMyRoomId;
   late MutsuRelaySetAsrLangDart _setAsrLang;
   late MutsuRelaySetCloseBehaviorDart _setCloseBehavior;
-  late MutsuRelaySendMessageDart _sendMessage;
   late MutsuRelayGetConfigDirPathDart _getConfigDirPath;
   late MutsuRelayGetLastErrorDart _getLastError;
   late MutsuRelayGetAsrLangDart _getAsrLang;
   late MutsuRelayGetCloseBehaviorDart _getCloseBehavior;
   late MutsuRelaySaveConfigDart _saveConfig;
   late MutsuRelayLoadConfigDart _loadConfig;
-  late MutsuRelayGetAudioLevelDart _getAudioLevel;
-  late MutsuRelayGetRecognitionResultDart _getRecognitionResult;
   late MutsuRelayPollRecordingDart _pollRecording;
   late MutsuRelayDownloadAsrModelDart _downloadAsrModel;
   late MutsuRelaySetSubtitleFilePathDart _setSubtitleFilePath;
   late MutsuRelayGetSubtitleFilePathDart _getSubtitleFilePath;
-  late MutsuRelaySetMemorySensitivityDart _setMemorySensitivity;
-  late MutsuRelayGetMemorySensitivityDart _getMemorySensitivity;
+  late MutsuRelayReloadAsrDart _reloadAsr;
+  late MutsuRelaySetSegmentMaxMsDart _setSegmentMaxMs;
+  late MutsuRelayGetSegmentMaxMsDart _getSegmentMaxMs;
+  late MutsuRelaySetInterimDart _setInterim;
+  late MutsuRelayGetInterimDart _getInterim;
+  late MutsuRelayEnqueueMessageDart _enqueueMessage;
+  late MutsuRelayPollSendResultsDart _pollSendResults;
+  late MutsuRelayGetStatsDart _getStats;
+  late MutsuRelayAsrStateDart _asrState;
 
   void _bindFunctions() {
     _init = _lib.lookupFunction<MutsuRelayInitC, MutsuRelayInitDart>(
@@ -382,10 +437,6 @@ class NativeBridge {
           MutsuRelaySetCloseBehaviorC,
           MutsuRelaySetCloseBehaviorDart
         >('mutsurelay_set_close_behavior');
-    _sendMessage = _lib
-        .lookupFunction<MutsuRelaySendMessageC, MutsuRelaySendMessageDart>(
-          'mutsurelay_send_message',
-        );
     _getConfigDirPath = _lib
         .lookupFunction<
           MutsuRelayGetConfigDirPathC,
@@ -412,15 +463,6 @@ class NativeBridge {
         .lookupFunction<MutsuRelayLoadConfigC, MutsuRelayLoadConfigDart>(
           'mutsurelay_load_config',
         );
-    _getAudioLevel = _lib
-        .lookupFunction<MutsuRelayGetAudioLevelC, MutsuRelayGetAudioLevelDart>(
-          'mutsurelay_get_audio_level',
-        );
-    _getRecognitionResult = _lib
-        .lookupFunction<
-          MutsuRelayGetRecognitionResultC,
-          MutsuRelayGetRecognitionResultDart
-        >('mutsurelay_get_recognition_result');
     _pollRecording = _lib
         .lookupFunction<MutsuRelayPollRecordingC, MutsuRelayPollRecordingDart>(
           'mutsurelay_poll_recording',
@@ -440,16 +482,46 @@ class NativeBridge {
           MutsuRelayGetSubtitleFilePathC,
           MutsuRelayGetSubtitleFilePathDart
         >('mutsurelay_get_subtitle_file_path');
-    _setMemorySensitivity = _lib
+    _reloadAsr = _lib
+        .lookupFunction<MutsuRelayReloadAsrC, MutsuRelayReloadAsrDart>(
+          'mutsurelay_reload_asr',
+        );
+    _setSegmentMaxMs = _lib
         .lookupFunction<
-          MutsuRelaySetMemorySensitivityC,
-          MutsuRelaySetMemorySensitivityDart
-        >('mutsurelay_set_memory_sensitivity');
-    _getMemorySensitivity = _lib
+          MutsuRelaySetSegmentMaxMsC,
+          MutsuRelaySetSegmentMaxMsDart
+        >('mutsurelay_set_segment_max_ms');
+    _getSegmentMaxMs = _lib
         .lookupFunction<
-          MutsuRelayGetMemorySensitivityC,
-          MutsuRelayGetMemorySensitivityDart
-        >('mutsurelay_get_memory_sensitivity');
+          MutsuRelayGetSegmentMaxMsC,
+          MutsuRelayGetSegmentMaxMsDart
+        >('mutsurelay_get_segment_max_ms');
+    _setInterim = _lib
+        .lookupFunction<MutsuRelaySetInterimC, MutsuRelaySetInterimDart>(
+          'mutsurelay_set_interim',
+        );
+    _getInterim = _lib
+        .lookupFunction<MutsuRelayGetInterimC, MutsuRelayGetInterimDart>(
+          'mutsurelay_get_interim',
+        );
+    _enqueueMessage = _lib
+        .lookupFunction<
+          MutsuRelayEnqueueMessageC,
+          MutsuRelayEnqueueMessageDart
+        >('mutsurelay_enqueue_message');
+    _pollSendResults = _lib
+        .lookupFunction<
+          MutsuRelayPollSendResultsC,
+          MutsuRelayPollSendResultsDart
+        >('mutsurelay_poll_send_results');
+    _getStats = _lib
+        .lookupFunction<MutsuRelayGetStatsC, MutsuRelayGetStatsDart>(
+          'mutsurelay_get_stats',
+        );
+    _asrState = _lib
+        .lookupFunction<MutsuRelayAsrStateC, MutsuRelayAsrStateDart>(
+          'mutsurelay_asr_state',
+        );
   }
 
   // ---- Public API (with null safety when not loaded) ----
@@ -600,16 +672,6 @@ class NativeBridge {
     }
   }
 
-  int sendMessage(String text) {
-    if (!_initialized) return -1;
-    final ptr = text.toNativeUtf8();
-    try {
-      return _sendMessage(ptr);
-    } finally {
-      calloc.free(ptr);
-    }
-  }
-
   String? getConfigDirPath() {
     if (!_initialized) return null;
     final result = _getConfigDirPath();
@@ -651,17 +713,6 @@ class NativeBridge {
   int saveConfig() => _initialized ? _saveConfig() : -1;
 
   int loadConfig() => _initialized ? _loadConfig() : -1;
-
-  double getAudioLevel() => _initialized ? _getAudioLevel() : 0.0;
-
-  String? getRecognitionResult() {
-    if (!_initialized) return null;
-    final ptr = _getRecognitionResult();
-    if (ptr == nullptr) return null;
-    final text = ptr.toDartString();
-    _freeString(ptr);
-    return text;
-  }
 
   Map<String, dynamic>? pollRecording() {
     if (!_initialized) return null;
@@ -707,11 +758,83 @@ class NativeBridge {
     return text;
   }
 
-  void setMemorySensitivity(double val) {
-    if (_initialized) _setMemorySensitivity(val);
+  // ---- P2/P3 API ----
+
+  /// 重建 ASR recognizer（换模型 / 换语言）。解码线程常驻，重建在后台完成，
+  /// 调用立即返回，不会卡 UI。
+  int reloadAsr(String modelDir) {
+    if (!_initialized) return -1;
+    final ptr = modelDir.toNativeUtf8();
+    try {
+      return _reloadAsr(ptr);
+    } finally {
+      calloc.free(ptr);
+    }
   }
 
-  double getMemorySensitivity() => _initialized ? _getMemorySensitivity() : 0.5;
+  /// 单段最大时长（毫秒），直接决定连续说话时的最坏出字延迟。
+  void setSegmentMaxMs(int ms) {
+    if (_initialized) _setSegmentMaxMs(ms);
+  }
+
+  int getSegmentMaxMs() => _initialized ? _getSegmentMaxMs() : 8000;
+
+  /// 实时半句预览（interim）开关。半句只进界面，不写字幕、不自动发言。
+  void setInterim(bool enabled) {
+    if (_initialized) _setInterim(enabled ? 1 : 0);
+  }
+
+  bool getInterim() => _initialized ? _getInterim() != 0 : true;
+
+  /// 把一条弹幕排入 native 的异步发送队列，立即返回 job id。
+  /// 返回值 <= 0 表示**立即失败**（未登录 / 未连接 / 内容为空），此时不会产生任务，
+  /// 错误原因用 [getLastError] 取。调用线程不会被网络阻塞。
+  int enqueueMessage(String text) {
+    if (!_initialized) return -1;
+    final ptr = text.toNativeUtf8();
+    try {
+      return _enqueueMessage(ptr);
+    } finally {
+      calloc.free(ptr);
+    }
+  }
+
+  /// 取走全部已完成的异步发送结果，每项形如
+  /// `{"id": 1, "ok": true, "ms": 120}` 或 `{"id": 1, "ok": false, "error": "...", "ms": 3000}`。
+  List<dynamic> pollSendResults() {
+    if (!_initialized) return const [];
+    final ptr = _pollSendResults();
+    if (ptr == nullptr) return const [];
+    final json = ptr.toDartString();
+    _freeString(ptr);
+    try {
+      final decoded = jsonDecode(json);
+      return decoded is List ? decoded : const [];
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  /// 运行统计（队列深度、丢样/丢段计数、解码延迟 p50/p95 等），用于性能观测。
+  Map<String, dynamic>? getStats() {
+    if (!_initialized) return null;
+    final ptr = _getStats();
+    if (ptr == nullptr) return null;
+    final json = ptr.toDartString();
+    _freeString(ptr);
+    try {
+      return jsonDecode(json) as Map<String, dynamic>;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  /// recognizer 加载状态：1 = 就绪，0 = 重建中/未尝试，-1 = 加载失败。
+  int asrState() => _initialized ? _asrState() : 0;
+
+  bool isAsrReady() => asrState() == 1;
+
+  bool isAsrFailed() => asrState() == -1;
 
   static void log(String message) {
     // ignore: avoid_print
