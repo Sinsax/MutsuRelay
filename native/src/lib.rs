@@ -69,16 +69,23 @@ const RING_CAPACITY: usize = 48_000 * 2;
 const CALLBACK_SCRATCH: usize = 16_384;
 /// front-end 单次从环形缓冲取出的上限
 const FRONTEND_READ: usize = 8_192;
-/// interim 节流间隔
-const INTERIM_INTERVAL: Duration = Duration::from_millis(1500);
-/// interim 至少要有这么长的段才值得跑
-const INTERIM_MIN_SEGMENT_MS: u64 = 1500;
+/// interim 节流间隔。
+///
+/// 1500 ms 太稀疏：用户说完一句话、VAD 退出语音态之后，界面上那条实时预览会先被
+/// 清掉，然后才等来正式结果 —— 观感就是"实时停了、电平也降了，过了一会才出字"。
+/// 实测解码 3 s 音频只要 73 ms（41× 实时），把间隔压到 800 ms 的代价约 5% 单核，
+/// 换来的是预览始终贴着语音走。
+const INTERIM_INTERVAL: Duration = Duration::from_millis(800);
+/// interim 至少要有这么长的段才值得跑。
+/// 500 ms 已经足够出一个词，再长就会漏掉短句的预览。
+const INTERIM_MIN_SEGMENT_MS: u64 = 500;
 /// 停止录音后多久（期间没有新录音）把 recognizer 卸掉。
 ///
 /// 常驻 recognizer 是"首句近零延迟"的关键，代价是**一直**占约 300 MB
 /// （实测：模型文件 228 MB → 加载后 RSS +298 MB）。而重建只要约 1 s，
-/// 所以长期不录音时留着并不划算。90 s 足以覆盖"录一段、停一下、接着录"的节奏。
-const IDLE_UNLOAD_DELAY: Duration = Duration::from_secs(90);
+/// 所以长期不录音时留着并不划算。60 s 足以覆盖"录一段、停一下、接着录"的节奏，
+/// 又让"只是开着界面"这种最长时间的占用回落到 Flutter 运行时本身（~200 MB）。
+const IDLE_UNLOAD_DELAY: Duration = Duration::from_secs(60);
 
 fn noise_gate() -> &'static Mutex<f32> {
     NOISE_GATE.get_or_init(|| Mutex::new(0.02))
@@ -168,6 +175,19 @@ fn trigger_reload_forced() {
     let lang = asr_lang().lock().map(|l| l.clone()).unwrap_or_default();
     if engine().reload_forced(dir, lang) {
         RELOAD_GEN.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// **只有已经装着 recognizer 时才重建**；从没装过就只更新目标，等首次录音再加载。
+///
+/// 给启动路径用（`init_asr` / `load_config` / `set_asr_lang`）。这些接口在应用启动时
+/// 会被连着调好几次，若它们直接 `trigger_reload`，应用**一打开就常驻 ~300 MB 模型**
+/// —— 而多数时间根本没在录音。这正是"内存占用高"的主要来源。
+///
+/// 已经装载时仍然要重建：换语言 / 换模型是 recognizer 的构造参数，不重建就不生效。
+fn trigger_reload_if_loaded() {
+    if asr::load_state() == asr::LOAD_READY {
+        trigger_reload();
     }
 }
 
@@ -503,10 +523,11 @@ pub extern "C" fn mutsurelay_init(model_dir_ptr: *const c_char) -> i32 {
     _init_internal(model_dir_ptr, false)
 }
 
-/// 启动路径：同步模型目录 / 语言 / 配置，并让 recognizer 就位。
+/// 启动路径：同步模型目录 / 语言 / 配置。**不加载模型**（懒加载，见下）。
 ///
-/// 不强制重建：应用启动时会连着来两次（先是 init_asr，随后 loadSettings →
-/// `mutsurelay_load_config`），目标一样就没必要把 229 MB 模型装两遍。
+/// 既不预加载也不强制重建：应用启动时会连着来两次（先是 init_asr，随后 loadSettings →
+/// `mutsurelay_load_config`），目标一样就没必要把 229 MB 模型装两遍 —— 而既然要懒加载，
+/// 这里一次都不该装。已经装着（例如界面上换过语言）才会真正重建。
 #[no_mangle]
 pub extern "C" fn mutsurelay_init_asr(model_dir_ptr: *const c_char) -> i32 {
     _init_internal(model_dir_ptr, false)
@@ -543,12 +564,15 @@ fn _init_internal(model_dir_ptr: *const c_char, forced: bool) -> i32 {
             *a = bilive::get_language();
         }
     }
-    // 解码线程常驻：这里只是让它换/建 recognizer。放在后台线程里做，
-    // 240 MB 的加载不再砸在首句语音上，也不会卡住调用方。
+    // 解码线程常驻，但**这里不预加载**：加载 = 约 1 s / 约 300 MB 常驻内存，而应用
+    // 刚打开时多半并不是要马上录音。"真正的加载"发生在两个地方：
+    //   - `mutsurelay_start_recording`（首次开录，与用户开口的时间重叠）
+    //   - `mutsurelay_reload_asr`（界面上的"重启 ASR"）
+    // 这样"只是开着界面"的常驻占用就从 ~500 MB 回落到 ~200 MB（Flutter 运行时本身）。
     if forced {
         trigger_reload_forced();
     } else {
-        trigger_reload();
+        trigger_reload_if_loaded();
     }
     INITIALIZED.store(true, Ordering::SeqCst);
     0
@@ -571,8 +595,9 @@ pub extern "C" fn mutsurelay_start_recording() -> i32 {
         return 0;
     }
     set_pipeline_error(String::new());
-    // 若 recognizer 被"空闲卸载"过（或还没建），立刻在后台重建：
-    // 这 ~1 s 与用户开口的时间重叠，不必等到首句语音才加载。
+    // **懒加载的真正入口**：recognizer 可能是"从没建过"（启动不预加载）或
+    // 被"空闲卸载"过，两种情况都在这里补上。这 ~1 s 与用户开口的时间重叠，
+    // 不必等到首句语音才加载。加载期间到达的段会排在段队列里（容量 4）等它。
     if asr::load_state() != asr::LOAD_READY {
         trigger_reload();
     }
@@ -932,9 +957,10 @@ pub extern "C" fn mutsurelay_set_asr_lang(lang: *const c_char) {
     if !changed {
         return;
     }
-    // 语言是 recognizer 的构造参数，改了必须重建才生效
+    // 语言是 recognizer 的构造参数，改了必须重建才生效。但**已经装着才需要重建**：
+    // 启动路径（loadSettings → set_asr_lang）在这里不该把模型拉进内存。
     bilive::set_language(&l);
-    trigger_reload();
+    trigger_reload_if_loaded();
 }
 
 #[no_mangle]
@@ -1058,7 +1084,7 @@ pub extern "C" fn mutsurelay_load_config() -> i32 {
             if let Ok(mut a) = asr_lang().lock() {
                 *a = bilive::get_language();
             }
-            trigger_reload();
+            trigger_reload_if_loaded();
             0
         }
         Err(_) => -1,

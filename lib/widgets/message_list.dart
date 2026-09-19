@@ -1,5 +1,6 @@
 import 'dart:math' show pi;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 import '../models/sentence_item.dart';
 import '../providers/app_state.dart';
@@ -47,6 +48,33 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
     } else if (state.editingId == null) {
       _prevEditId = null;
     }
+  }
+
+  /// 双击复制到剪贴板。
+  ///
+  /// 复制的是**完整原文**：列表里为了排版会 `maxLines: 2` 截断，双击拿到的仍然是
+  /// 整句（不然用户复制到的是一串省略号，毫无意义）。
+  void _copyOnDoubleTap(String text) {
+    if (text.isEmpty) return;
+    Clipboard.setData(ClipboardData(text: text)).ignore();
+    context.read<AppState>().showToast('已复制到剪贴板');
+  }
+
+  /// 给文本包一层"双击复制"，并挂一条提示。列表与实时预览共用。
+  Widget _copyable(Widget child, String text) {
+    return GestureDetector(
+      // opaque：让两个字之间的空白也能双击命中，手感更接近"双击这一行"
+      behavior: HitTestBehavior.opaque,
+      onDoubleTap: () => _copyOnDoubleTap(text),
+      child: Tooltip(
+        message: '双击复制',
+        // 显式 longPress：桌面上悬停仍然会出提示，但**轻点不会**——
+        // 轻点是"双击复制"的前半截，不该顺手弹一个工具提示。
+        triggerMode: TooltipTriggerMode.longPress,
+        waitDuration: const Duration(milliseconds: 500),
+        child: child,
+      ),
+    );
   }
 
   @override
@@ -272,11 +300,14 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
       decoration: BoxDecoration(
         border: Border(left: BorderSide(color: AppColors.primary, width: 3)),
       ),
-      child: Text(
+      child: _copyable(
+        Text(
+          text,
+          style: mini
+              ? AppTextStyles.liveEntry.copyWith(fontSize: 11, color: invert ? AppColors.textDark : Colors.white, fontWeight: FontWeight.w500, shadows: invert ? const [Shadow(color: Color(0x60FFFFFF), blurRadius: 4, offset: Offset(0, 1))] : const [Shadow(color: Color(0x80000000), blurRadius: 4, offset: Offset(0, 1))])
+              : AppTextStyles.liveEntry,
+        ),
         text,
-        style: mini
-            ? AppTextStyles.liveEntry.copyWith(fontSize: 11, color: invert ? AppColors.textDark : Colors.white, fontWeight: FontWeight.w500, shadows: invert ? const [Shadow(color: Color(0x60FFFFFF), blurRadius: 4, offset: Offset(0, 1))] : const [Shadow(color: Color(0x80000000), blurRadius: 4, offset: Offset(0, 1))])
-            : AppTextStyles.liveEntry,
       ),
     );
   }
@@ -372,17 +403,20 @@ class _MessageListState extends State<MessageList> with TickerProviderStateMixin
               )
             else
               Expanded(
-                child: Text(
-                  item.text,
-                  style: TextStyle(
-                    fontSize: mini ? 11 : 12,
-                    color: mini ? (invert ? AppColors.textDark : Colors.white) : AppColors.text,
-                    fontWeight: mini ? FontWeight.w600 : null,
-                    decoration: item.isSuccess ? TextDecoration.lineThrough : null,
-                    shadows: mini ? (invert ? const [Shadow(color: Color(0x60FFFFFF), blurRadius: 4, offset: Offset(0, 1))] : const [Shadow(color: Color(0x80000000), blurRadius: 4, offset: Offset(0, 1))]) : null,
+                child: _copyable(
+                  Text(
+                    item.text,
+                    style: TextStyle(
+                      fontSize: mini ? 11 : 12,
+                      color: mini ? (invert ? AppColors.textDark : Colors.white) : AppColors.text,
+                      fontWeight: mini ? FontWeight.w600 : null,
+                      decoration: item.isSuccess ? TextDecoration.lineThrough : null,
+                      shadows: mini ? (invert ? const [Shadow(color: Color(0x60FFFFFF), blurRadius: 4, offset: Offset(0, 1))] : const [Shadow(color: Color(0x80000000), blurRadius: 4, offset: Offset(0, 1))]) : null,
+                    ),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
                   ),
-                  maxLines: 2,
-                  overflow: TextOverflow.ellipsis,
+                  item.text,
                 ),
               ),
             const SizedBox(width: 6),

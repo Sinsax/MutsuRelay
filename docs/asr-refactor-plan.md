@@ -809,5 +809,120 @@ recognizer = create_recognizer(&model_dir, &lang);   // 旧 session 在新 sessi
 - 启动仍预加载 → 刚打开约 500 MB；若要"打开就轻"，可改成完全惰性加载，代价是首句慢 2 s。
 - interim 窗口 **3 s**：实测只值 73 ms，可放心保留；间隔 1.5 s 的 CPU 代价约 5%（仅在持续说话时）。
 
+> 以上三条在第四轮已全部落定：卸载阈值 90 s → **60 s**、启动**不再预加载**、
+> interim 间隔 1.5 s → **0.8 s**。见第十三节。
 
+## 十三、真机反馈修复（第四轮：关闭卡顿 / 内存 / 双击复制 / 出字延迟）
 
+用户报了 4 项，逐条定位到根因。**其中 4 号（出字延迟）与第三轮的判断不同源**，
+是这一轮才找到的真正机制。
+
+### 13.1 关闭窗口"卡住一下才消失"
+
+**根因链**（不是 native 慢，也不是托盘慢）：
+
+1. `windowManager.destroy()` 在 Windows 上**只是 `PostQuitMessage(0)`**
+   （`window_manager.cpp` → `WindowManager::Destroy`），它**不销毁窗口**。
+2. 窗口要等整个进程收尾走完才会被销毁：消息循环退出 → Flutter engine 关闭并 join
+   各渲染/栅格线程 → 各插件 DLL detach → 还有约 300 MB 的 onnxruntime session 要回收。
+3. 这段时间里窗口仍挂在屏幕上、但已经不再重绘 —— 用户看到的就是
+   **"点了关闭，先卡住一下，然后才消失"**。
+4. 附带发现：`setPreventClose` **从未被调用过**，所以 `app.dart` 里的
+   `onWindowClose` 一直是**死代码**；Alt+F4 会直接销毁窗口 → 既不经过 native 的
+   停止录音，也不删托盘图标（通知区留下"幽灵图标"）。
+
+**修法**：新增 `lib/app_lifecycle.dart: quitApp()`，顺序有意设计为
+`hide()` + `setSkipTaskbar(true)` → `NativeBridge.shutdown()` → 删托盘图标 → `destroy()`。
+**先让窗口从屏幕上消失，再收尾**，那一段收尾时间就从用户视野里彻底消失了。
+三个调用点（顶栏关闭按钮、托盘菜单"退出"、`onWindowClose`）统一走它；
+启动时补上 `setPreventClose(true)`，让 Alt+F4 也走同一条路径。
+
+### 13.2 内存 500 MB → 约 200 MB（懒加载）
+
+约 300 MB 是常驻 recognizer（模型文件 228 MB → 加载后 RSS +298 MB）。
+旧实现在**启动路径**上就会加载：`init_asr` / `load_config` / `set_asr_lang`
+各自都会 `trigger_reload()`，而这三个接口在应用启动时会被连着调好几次 ——
+于是"打开就占 500 MB"，而多数时间根本没在录音。
+
+**修法**：新增 `trigger_reload_if_loaded()`（只有**已经装着**才重建），
+启动路径改用它；真正的加载入口收敛到 `mutsurelay_start_recording`（首次开录，
+与用户开口的时间重叠）。空闲卸载阈值 90 s → **60 s**。
+
+**结果**：只是开着界面 ≈ 200 MB（Flutter 运行时本身 + DLL），录音期间仍是 ~500 MB，
+停录 60 s 后回落到 ~200 MB。
+
+### 13.3 双击文字复制到剪贴板
+
+`message_list.dart` 新增 `_copyable()`：`GestureDetector(onDoubleTap)` +
+`Tooltip('双击复制')`，套在**消息列表文本**与**实时预览**上，迷你窗口同样生效。
+复制的是**完整原文** —— 列表 `maxLines: 2` 会截断显示，双击拿到的仍是整句。
+`Tooltip` 显式设 `triggerMode: longPress`：桌面上悬停照样出提示，但轻点不会弹
+（轻点是"双击复制"的前半截）。
+
+### 13.4 "实时停了、电平也降了，却迟迟不出字" —— 判停口径错了
+
+**症状**：实时预览停住不再出新字、电平已经降下去，但正式结果要等很久才出来，
+而且**时快时慢**。
+
+**根因**：退出语音态的门限是 `gate * VAD_HYSTERESIS = gate*0.5`。
+房间底噪常常正好落在 `(gate*0.5, gate)` 区间 —— 高于退出线、低于进入线。
+此时：
+
+- `in_speech` 保持为真 → 实时预览停在最后那句话上（没有新字）；
+- 电平表已经衰减回底噪（用户看到"电平降了"）；
+- `silence_frames` **永远不累加** → 静音判停永不触发 → 段只能等
+  `max_segment_samples`（默认 **8 s**）强制切段才能出字。
+
+三个现象被一次解释干净。"时快时慢"则取决于那一刻的底噪是否恰好低于 `gate*0.5`。
+
+**注意 `max_silence_frames` 在这里帮不上忙**（这是很容易看错的一点）：它要求
+`silence_frames` 先累加，而累加的前提正是"判不出静音"这件事本身；并且当
+`long_enough` 为真时它根本不参与判决。
+
+**修法**：退出判停改用**段起点处的噪声底**做参照，而不是用户门限的固定比例：
+
+```text
+exit_threshold = max(gate * VAD_HYSTERESIS, seg_noise_floor * VAD_EXIT_NOISE_RATIO)
+```
+
+- 只在"起点电平 > 噪声底 × 3"时启用；否则退回 `gate*HYSTERESIS`。
+  门限被压到低于底噪属于**设置问题**，不该由自适应逻辑去猜（否则会把整段判成静音、
+  把段切碎）。
+- 噪声底取**本帧 EMA 更新之前**的值：语音起点自己的能量若被算进噪声底，会把退出
+  门限抬得过高，等于把刚修好的问题换个方式又引回来。
+
+**效果**：停嘴后 300 ms（`min_silence`）收段 + 解码 ~73 ms + Dart 轮询 50 ms
+≈ **0.45 s 出字**，且与门限松紧、底噪高低解耦。
+
+### 13.5 本轮验证
+
+| 项 | 结果 |
+|---|---|
+| `cargo check --all-targets` | 通过，无警告 |
+| `cargo test` | **67 passed / 0 failed**（65 → +2） |
+| `smoke_native.py` | **51 PASS / 0 FAIL / 0 WARN**，新增 `[6d] 懒加载与空闲卸载` 全绿 |
+| `flutter analyze` | No issues found |
+| `flutter test` | 通过（新增双击复制的 widget 测试） |
+| ABI | dll=2 / dart=2（**未增删导出符号**） |
+| 录音链路 | 3 s 采到 481 chunks、`dropped_samples=0`；3 轮起停累计 618 chunks |
+
+新增回归测试：
+
+- `segmenter::segment_closes_when_noise_sits_above_half_gate` —— 底噪落在
+  `(gate*0.5, gate)` 时必须在 300 ms 判停收段（旧口径要等 8 s）
+- `segmenter::adaptive_exit_is_disabled_when_gate_is_below_noise` —— 门限低于底噪时
+  不得启用自适应判停
+- `smoke_native.py [3]`：启动路径不预加载模型（`asr_state == 0`）
+- `smoke_native.py [6d]`：空目录 = 卸载且状态回 IDLE(0) 而非 FAILED(-1) /
+  未录音时同目标空转不重建 / 开始录音时自动加载且只加载一次
+- `test/message_list_copy_test.dart`：双击复制完整原文，单击不触发
+
+### 13.6 取舍（本轮已定，前几轮的遗留项一并结清）
+
+- 空闲卸载阈值 **60 s**（原 90 s）。调更小更省内存，代价是每次开录前多等约 1~2 s
+  模型加载；那段时间与"用户刚点下录音、还没开口"重叠，段队列容量 4 足以容纳。
+- **启动不再预加载**：只是开着界面 ≈ 200 MB；首句延迟转移到"点录音之后"，
+  由 `start_recording` 的后台加载覆盖。
+- interim 间隔 **0.8 s**、窗口 **3 s**（实测解码 73 ms，CPU 代价约 5%，且仅在持续说话时）。
+- 关闭窗口：**先隐藏再收尾**，不再试图让进程"秒退"（进程收尾本身仍要几百毫秒，
+  只是用户看不见了）。

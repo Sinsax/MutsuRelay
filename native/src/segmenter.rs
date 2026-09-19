@@ -39,6 +39,20 @@ pub const DEFAULT_MIN_SPEECH_MS: u32 = 90;
 pub const DEFAULT_ENERGY_FLOOR: f32 = 0.005;
 /// 滞回系数：已进入语音态时门限降低，避免句子中间被切断。
 pub const VAD_HYSTERESIS: f32 = 0.5;
+/// 语音态**退出**门限相对"段起点前噪声底"的倍数。
+///
+/// 退出判停不能只看"用户门限的一半"：房间底噪常常正好落在 `gate*0.5` 与 `gate`
+/// 之间。那种情况下 `silence_frames` 永远不累加，段只能等 `max_segment_samples`
+/// （默认 8 s）强制切段 —— 用户看到的是**"实时预览停住了、电平也降下去了，却迟迟
+/// 不出字"**，而且时快时慢（取决于那一刻的底噪是否恰好低于 `gate*0.5`）。
+/// 用段起点处的噪声底做参照，判停就与门限松紧解耦，且段内不会被自己的语音污染
+/// （进入语音态后噪声底几乎冻结）。
+pub const VAD_EXIT_NOISE_RATIO: f32 = 1.5;
+/// 只有段的起点电平明显高于噪声底（这个倍数）时，才启用上面的自适应判停。
+///
+/// 否则（用户把门限压到远低于底噪、或底噪还没测出来）宁可退回原来的
+/// `gate*HYSTERESIS`：那说明门限设置本身就有问题，不该由自适应逻辑去"猜"。
+const VAD_ADAPTIVE_MIN_SNR: f32 = 3.0;
 
 fn ms_to_samples(ms: u32) -> usize {
     ASR_SAMPLE_RATE as usize * ms as usize / 1000
@@ -160,6 +174,10 @@ pub struct Segmenter {
     seg_raw_n: u64,
     /// 当前段的起点时间
     seg_onset_ms: u64,
+    /// 起点那一帧的原始能量（用于判断"这是不是真语音"，见 `exit_threshold`）
+    seg_onset_level: f32,
+    /// 起点**之前**（本帧的 EMA 更新之前）的噪声底，退出判停的参照
+    seg_noise_floor: f32,
     /// 当前段与上一段的重叠时长（毫秒）
     seg_seam_overlap_ms: u32,
     /// 上一段结尾在时间轴上的位置（样本数），用于精确计算接缝重叠
@@ -190,6 +208,8 @@ impl Segmenter {
             seg_raw_sq: 0.0,
             seg_raw_n: 0,
             seg_onset_ms: 0,
+            seg_onset_level: 0.0,
+            seg_noise_floor: 0.0,
             seg_seam_overlap_ms: 0,
             last_close_end: None,
             noise_floor: 0.01,
@@ -228,6 +248,21 @@ impl Segmenter {
 
     pub fn gain(&self) -> f32 {
         self.gain
+    }
+
+    /// 语音态的**退出**门限（原始能量域）。
+    ///
+    /// 基准是 `gate * VAD_HYSTERESIS`（滞回），但在"起点电平明显高于噪声底"时改用
+    /// `噪声底 * VAD_EXIT_NOISE_RATIO`：后者才是"这句话说完了"的正确判据。原因见
+    /// [`VAD_EXIT_NOISE_RATIO`] 的注释 —— 只按 `gate*0.5` 判停，底噪恰好落在
+    /// `(gate*0.5, gate)` 区间时永远判不出静音，段只能等 8 s 强制切段。
+    fn exit_threshold(&self) -> f32 {
+        let base = self.cfg.gate * VAD_HYSTERESIS;
+        if self.seg_onset_level > self.seg_noise_floor * VAD_ADAPTIVE_MIN_SNR {
+            base.max(self.seg_noise_floor * VAD_EXIT_NOISE_RATIO)
+        } else {
+            base
+        }
     }
 
     pub fn processed_ms(&self) -> u64 {
@@ -282,6 +317,8 @@ impl Segmenter {
         self.seg_raw_sq = 0.0;
         self.seg_raw_n = 0;
         self.seg_seam_overlap_ms = 0;
+        self.seg_onset_level = 0.0;
+        self.seg_noise_floor = 0.0;
         self.last_close_end = None;
         self.pre_roll_pos = 0;
         self.pre_roll_filled = 0;
@@ -321,9 +358,15 @@ impl Segmenter {
 
     /// 进入语音态。**必须在把当前帧写进 pre-roll 缓冲之前调用**，
     /// 否则起点那一帧会同时出现在 pre-roll 尾部和段首。
-    fn begin_segment(&mut self) {
+    ///
+    /// `onset_level` / `prev_noise_floor` 是起点那一帧的原始能量、以及**该帧 EMA 更新
+    /// 之前**的噪声底。两者一起决定本段的退出判停门限（见 [`Self::exit_threshold`]）：
+    /// 噪声底必须在更新前取，否则语音起点的能量会污染它，把退出门限抬得过高。
+    fn begin_segment(&mut self, onset_level: f32, prev_noise_floor: f32) {
         let onset = self.processed_samples;
         self.seg_onset_ms = samples_to_ms(onset as usize);
+        self.seg_onset_level = onset_level;
+        self.seg_noise_floor = prev_noise_floor;
         self.seg_pre_roll = self.snapshot_pre_roll();
         // 精确计算与上一段的重叠：pre-roll 覆盖 [onset - len, onset)，
         // 上一段的音频结束于 last_close_end，两者的交叠就是重复时长。
@@ -396,11 +439,16 @@ impl Segmenter {
         self.seg_raw_sq = 0.0;
         self.seg_raw_n = 0;
         self.seg_seam_overlap_ms = 0;
+        self.seg_onset_level = 0.0;
+        self.seg_noise_floor = 0.0;
     }
 
     /// 送入一帧音频（长度应为 `cfg.frame_samples`）。
     pub fn push_frame(&mut self, frame: &[f32], out: &mut Vec<SegmentEvent>) -> FrameOutcome {
         let raw_energy = rms(frame);
+        // 本帧 EMA 更新**之前**的噪声底。若本帧正好是段的起点，它就是"这句话开始之前
+        // 的房间底噪"，退出判停要用它（用更新后的值会被语音起点自己污染）。
+        let prev_noise_floor = self.noise_floor;
 
         // ---- 噪声底：只用原始能量（单一能量域）----
         let rate = if self.in_speech { 0.999 } else { 0.92 };
@@ -428,8 +476,9 @@ impl Segmenter {
         let gated = &gated_buf[..n];
 
         // ---- 判决（原始能量 vs 用户门限）----
+        // 退出用自适应门限，进入用用户门限：见 `exit_threshold`。
         let active = if self.in_speech {
-            raw_energy >= self.cfg.gate * VAD_HYSTERESIS
+            raw_energy >= self.exit_threshold()
         } else {
             raw_energy >= self.cfg.gate
         };
@@ -441,7 +490,7 @@ impl Segmenter {
                 self.in_speech = true;
                 self.consecutive_speech = 1;
                 // 快照必须在 pre-roll 缓冲吸收本帧之前完成
-                self.begin_segment();
+                self.begin_segment(raw_energy, prev_noise_floor);
                 out.push(SegmentEvent::Start {
                     onset_ms: samples_to_ms(self.processed_samples as usize),
                 });
@@ -719,6 +768,56 @@ mod tests {
         let segs = emitted(&out);
         assert_eq!(segs.len(), 2);
         assert_eq!(segs[1].seam_overlap_ms, 0, "间隔 900ms 已超出 pre-roll 窗口");
+    }
+
+    /// 回归：底噪落在 `(gate*0.5, gate)` 区间时，段必须**按时**收尾。
+    ///
+    /// 这是真机上"实时预览停住了、电平也降下去了，却迟迟不出字"的根因：判停只比
+    /// `gate*0.5`，而房间底噪（0.015）高于它、又低于门限（0.02）→ `silence_frames`
+    /// 永远不累加 → 段只能等 `max_segment_samples`（默认 8 s）强制切段，所以"有时候快
+    /// 有时候慢"（取决于那一刻的底噪是否恰好低于 `gate*0.5`）。
+    #[test]
+    fn segment_closes_when_noise_sits_above_half_gate() {
+        const NOISE: f32 = 0.015; // > gate*0.5 (0.01)、< gate (0.02)
+        let mut s = Segmenter::new(cfg());
+        let mut out = Vec::new();
+        // 先静置 1 s，让噪声底收敛到真实底噪
+        push_many(&mut s, &frames_at(30, NOISE), &mut out);
+        assert!(!s.in_speech(), "底噪低于门限，不该进入语音态");
+        // 说 0.6 s，然后停下来（停下来的音量仍高于 gate*0.5）
+        push_many(&mut s, &frames_at(20, SPEECH), &mut out);
+        push_many(&mut s, &frames_at(30, NOISE), &mut out);
+
+        let segs = emitted(&out);
+        assert_eq!(segs.len(), 1, "停嘴后应当收出一个段");
+        // 20 帧语音 + 10 帧判停静音 = 900 ms。旧口径会一直等到 8 s 强制切段。
+        assert!(
+            segs[0].duration_ms <= 1100,
+            "段长 {}ms 说明判停没有及时收尾（旧口径要等 8 s 强制切段）",
+            segs[0].duration_ms
+        );
+        assert!(!s.in_speech(), "停嘴 0.9 s 后不该还留在语音态里");
+    }
+
+    /// 门限被压到远低于底噪时，**不要**启用自适应判停。
+    ///
+    /// 那种情况下"起点电平 ≈ 噪声底"，自适应会把整段都判成静音、把段切碎。宁可退回
+    /// 原来的 `gate*HYSTERESIS`：门限设置本身有问题，该让用户看到原始症状。
+    #[test]
+    fn adaptive_exit_is_disabled_when_gate_is_below_noise() {
+        const NOISE: f32 = 0.01;
+        let mut c = cfg();
+        c.gate = 0.001; // 远低于底噪
+        let mut s = Segmenter::new(c);
+        let mut out = Vec::new();
+        push_many(&mut s, &frames_at(20, NOISE), &mut out);
+        // 底噪高于门限 → 被判成"语音"，这是门限设置问题，不是分段问题
+        assert!(s.in_speech());
+        assert!(
+            s.exit_threshold() < NOISE,
+            "起点电平与噪声底同量级时，退出门限 {:?} 不该高于底噪 {NOISE}",
+            s.exit_threshold()
+        );
     }
 
     /// 单一能量域的回归：开启抑制时，略高于门限的语音仍要被判为语音。

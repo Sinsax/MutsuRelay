@@ -1,9 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:window_manager/window_manager.dart';
-import 'package:tray_manager/tray_manager.dart';
+import 'app_lifecycle.dart';
 import 'providers/app_state.dart';
-import 'ffi/native_bridge.dart';
 import 'theme/app_theme.dart';
 import 'widgets/top_bar.dart';
 import 'widgets/settings_modal.dart';
@@ -51,14 +50,14 @@ class _MutsuRelayHomeState extends State<MutsuRelayHome> with WindowListener {
 
   @override
   void onWindowClose() async {
+    if (!mounted) return;
+    // 注意：`context.read` 必须发生在任何 await 之前。
     final state = context.read<AppState>();
     if (state.closeBehavior == CloseBehavior.hide) {
       await windowManager.setOpacity(0.0);
-    } else {
-      NativeBridge.instance.shutdown();
-      await trayManager.destroy();
-      await windowManager.destroy();
+      return;
     }
+    await quitApp();
   }
 
   @override

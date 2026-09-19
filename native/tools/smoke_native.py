@@ -262,6 +262,16 @@ def main():
         r = init_asr(model_dir.encode("utf-8"))
         (ok if r == 0 else bad)("mutsurelay_init_asr 返回 0", f"got {r}")
 
+    # 启动路径**不得**把模型装进内存：常驻 recognizer 约 300 MB（模型文件 228 MB →
+    # 加载后 RSS +298 MB），而应用刚打开时多数时间并没有在录音。
+    # 加载推迟到"首次开始录音"，见 [6d]。
+    if asr_state:
+        st0 = asr_state()
+        if st0 == 0:
+            ok("启动路径不预加载模型（懒加载）", "state=0，未录音时不占 ~300 MB")
+        else:
+            bad("启动路径不预加载模型（懒加载）", f"state={st0}（期望 0 = IDLE）")
+
     # --- 4. 基线 poll ---
     print("\n[4] 基线状态")
     p = jpoll()
@@ -448,6 +458,74 @@ def main():
         if save_cfg:
             save_cfg()
         (ok if wait_ready() == 1 else bad)("还原语言后 ASR 就绪", f"state={asr_state()}")
+
+    # --- 6d. 懒加载 / 空闲卸载 ---
+    # 真机反馈："内存占用 500 MB"。其中约 300 MB 是常驻的 recognizer
+    # （模型文件 228 MB → 加载后 RSS +298 MB）。旧实现在启动路径
+    # （init_asr / load_config / set_asr_lang）里就把模型装进内存，而多数时间
+    # 根本没在录音。现在改成**首次开始录音时才加载**，停止录音 60 s 后自动卸载。
+    # 这里把两条都钉成回归。
+    print("\n[6d] 懒加载与空闲卸载")
+    if reload_asr and asr_state and start_rec and stop_rec:
+        # 1) 传空模型目录 = 主动卸载（与"空闲 60 s 自动卸载"是同一条代码路径）
+        #
+        # 注意：`request_reload` 会在**调用方线程**先把 LOAD_STATE 置成 IDLE 再入队
+        # （那是为了避免 UI 读到陈旧的 READY），所以"等 asr_state 变成 0"会和解码
+        # 线程赛跑 —— 必须等 `asr_reloads` 真的增长，才说明卸载已经落地。
+        r0 = (jstats() or {}).get("asr_reloads", 0)
+        reload_asr(b"")
+        dl = time.time() + 30
+        while time.time() < dl and (jstats() or {}).get("asr_reloads", 0) == r0:
+            time.sleep(0.2)
+        r1 = (jstats() or {}).get("asr_reloads", 0)
+        if r1 > r0:
+            ok("卸载请求已被解码线程处理", f"reloads +{r1 - r0}")
+        else:
+            bad("卸载请求已被解码线程处理", "30 s 内未处理")
+        st_val = asr_state()
+        if st_val == 0:
+            ok("卸载后状态回到 IDLE(0)", "空模型目录 = 主动卸载，不是加载失败")
+        elif st_val == -1:
+            bad(
+                "卸载后状态回到 IDLE(0)",
+                "被记成 FAILED(-1)：界面会误报“ASR 加载失败”",
+            )
+        else:
+            bad("卸载后状态回到 IDLE(0)", f"state={st_val}（仍显示就绪？）")
+
+        # 2) 启动路径只同步目标，不得把模型拉回内存
+        init_asr(model_dir.encode("utf-8"))
+        load_cfg()
+        if save_cfg:
+            save_cfg()
+        time.sleep(1.0)
+        if asr_state() == 0:
+            ok("启动路径不预加载模型", "init_asr + load_config 后仍未就绪")
+        else:
+            bad("启动路径不预加载模型", f"state={asr_state()}（期望 0）")
+        dr = (jstats() or {}).get("asr_reloads", 0) - r1
+        if dr == 0:
+            ok("未录音时的同目标空转不触发重建", f"reloads +{dr}")
+        else:
+            bad("未录音时的同目标空转不触发重建", f"reloads +{dr}（期望 0）")
+
+        # 3) 开始录音必须自己把模型装回来 —— 这是懒加载真正的入口
+        r2 = (jstats() or {}).get("asr_reloads", 0)
+        start_rec()
+        dl = time.time() + 60
+        while time.time() < dl and asr_state() == 0:
+            time.sleep(0.25)
+        if asr_state() == 1:
+            ok("开始录音时自动加载模型", "懒加载入口生效")
+        else:
+            bad("开始录音时自动加载模型", f"state={asr_state()}（期望 1）")
+        dr = (jstats() or {}).get("asr_reloads", 0) - r2
+        if dr == 1:
+            ok("自动加载只重建一次", f"reloads +{dr}")
+        else:
+            bad("自动加载只重建一次", f"reloads +{dr}（期望 1）")
+        stop_rec()
+        time.sleep(0.5)
 
     # --- 7. 配置读取 ---
     print("\n[7] 配置持久化")

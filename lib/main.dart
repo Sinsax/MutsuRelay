@@ -8,6 +8,7 @@ import 'package:provider/provider.dart';
 import 'package:window_manager/window_manager.dart';
 import 'package:tray_manager/tray_manager.dart';
 import 'app.dart';
+import 'app_lifecycle.dart';
 import 'ffi/native_bridge.dart';
 import 'providers/app_state.dart';
 import 'theme/app_theme.dart';
@@ -162,9 +163,7 @@ Future<void> _initTray(AppState appState, String iconPath) async {
         key: 'quit',
         label: '退出',
         onClick: (_) async {
-          NativeBridge.instance.shutdown();
-          await trayManager.destroy();
-          await windowManager.destroy();
+          await quitApp();
         },
       ),
     ],
@@ -206,6 +205,12 @@ void main() async {
   await windowManager.setSize(
     const Size(AppInsets.normalW, AppInsets.normalH),
   );
+
+  // 拦下系统关闭（Alt+F4 / 任务栏右键关闭），交给 Dart 侧的 `onWindowClose` 处理，
+  // 让它和"关闭窗口时"的设置（退出 / 托盘）保持一致。
+  // 不设这一条时，Alt+F4 会直接销毁窗口 → 既不删托盘图标（通知区留下幽灵图标），
+  // 也不走 native 的停止录音。
+  await windowManager.setPreventClose(true);
 
   SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
     statusBarColor: Colors.transparent,

@@ -1,10 +1,9 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'package:window_manager/window_manager.dart';
-import 'package:tray_manager/tray_manager.dart';
+import '../app_lifecycle.dart';
 import '../models/user_info.dart';
 import '../providers/app_state.dart';
-import '../ffi/native_bridge.dart';
 import '../theme/app_theme.dart';
 
 class TopBar extends StatelessWidget {
@@ -260,9 +259,9 @@ class TopBar extends StatelessWidget {
   VoidCallback _closeWindow(CloseBehavior closeBehavior) {
     return () {
       if (closeBehavior == CloseBehavior.exit) {
-        NativeBridge.instance.shutdown();
-        trayManager.destroy();
-        windowManager.destroy();
+        // 先隐藏再收尾：destroy() 只是 PostQuitMessage，窗口要等进程收完尾才消失，
+        // 那段时间看起来就是"卡住"。详见 quitApp() 的注释。
+        quitApp();
       } else {
         windowManager.setOpacity(0.0);
       }

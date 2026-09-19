@@ -496,7 +496,9 @@ impl AsrEngine {
 /// 否则 A/B 对比会因为配置不同而失去意义）。
 pub fn create_recognizer(model_dir: &str, lang: &str) -> Option<sherpa_onnx::OfflineRecognizer> {
     if model_dir.is_empty() {
-        log::warn!("[rust] ASR model dir is empty, recognizer not created");
+        // 空目录是**主动卸载**（空闲省内存），不是配置错误：不要用 warn/error
+        // 把它写成一条看起来像失败的日志。
+        log::info!("[rust] ASR model dir is empty → recognizer released (idle unload)");
         return None;
     }
     let dir = std::path::Path::new(model_dir);
