@@ -96,6 +96,24 @@ class _MutsuRelayHomeState extends State<MutsuRelayHome> with WindowListener {
                   ],
                 ),
               ),
+              // 右下角使用提示：**只在普通模式**出现（迷你窗有自己的 MiniScreen），
+              // 颜色刻意很淡，且 IgnorePointer 保证它不吃任何点击。
+              // 文案与 message_list.dart 里双击复制的 Tooltip 保持一致。
+              if (!isMini)
+                Positioned(
+                  right: 8,
+                  bottom: 4,
+                  child: IgnorePointer(
+                    child: Text(
+                      '双击消息可复制',
+                      style: TextStyle(
+                        fontSize: 10,
+                        letterSpacing: 0.2,
+                        color: AppColors.textDim.withValues(alpha: 0.75),
+                      ),
+                    ),
+                  ),
+                ),
               // Overlays
               const SettingsModal(),
               const QrLoginModal(),

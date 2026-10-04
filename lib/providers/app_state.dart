@@ -214,14 +214,43 @@ class AppState extends ChangeNotifier {
     return '极迟钝';
   }
 
+  /// 灵敏度手势的"收尾"延迟：松手后不立刻落盘，再等这么久；期间若又开始拖动就取消。
+  ///
+  /// 为什么敢延迟：门限是**纯运行时参数** —— native 前端线程每一轮都重读
+  /// `noise_gate()`（lib.rs:427），改完立刻生效，**不需要重建 recognizer**。
+  /// 所以要防的只是"一次拖动写十几次 config.toml + 走十几遍设置同步"。
+  static const _gateCommitDelay = Duration(milliseconds: 700);
+
+  Timer? _gateCommitTimer;
+
   void setNoiseGateFromSlider(int val) {
+    // 又开始拖了：作废上一轮待提交
+    _gateCommitTimer?.cancel();
+    _gateCommitTimer = null;
     _noiseGateDisplay = val;
     _noiseGate = 0.001 * val;
     NativeBridge.instance.setNoiseGate(_noiseGate);
     // 这里**不写配置**：滑块每一次 onChanged 都写盘 + 走一遍 saveSettings，
     // 而 saveSettings 会调 setAsrLang —— native 侧一次语言变更 = 重新加载
-    // 229 MB 模型（约 1.4 s），拖动一次就是几十次重建。持久化交给 onChangeEnd。
+    // 229 MB 模型（约 1.4 s），拖动一次就是几十次重建。
+    // 拖动过程只改 native 的原子量，落盘交给 [commitNoiseGateSoon]。
     notifyListeners();
+  }
+
+  /// 手势按下（或指针重新进入拖动）：取消上一轮尚未落盘的提交。
+  void beginNoiseGateDrag() {
+    _gateCommitTimer?.cancel();
+    _gateCommitTimer = null;
+  }
+
+  /// 手势结束（松开 / 指针离开）后才调用：再延迟 [_gateCommitDelay] 落盘，
+  /// 期间只要重新开始拖动就会被取消，所以"连续来回拖"最终只写一次盘。
+  void commitNoiseGateSoon() {
+    _gateCommitTimer?.cancel();
+    _gateCommitTimer = Timer(_gateCommitDelay, () {
+      _gateCommitTimer = null;
+      saveSettings();
+    });
   }
 
   // Window

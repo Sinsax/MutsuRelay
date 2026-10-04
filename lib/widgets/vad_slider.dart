@@ -34,9 +34,11 @@ class VadSlider extends StatelessWidget {
                 onChanged: (v) {
                   state.setNoiseGateFromSlider(v.round());
                 },
-                // 松手才持久化：拖动过程只更新运行时门限（native 侧是几个原子量），
-                // 不写盘、不触发 ASR 重建。
-                onChangeEnd: (_) => state.saveSettings(),
+                // 只有"操作真正结束"（松手 / 指针离开）才落盘，而且再等一小段：
+                // 拖动过程只更新运行时门限（native 前端线程每轮重读的原子量），
+                // 既不写盘、也不触发 ASR 重建；来回拖也只写一次。
+                onChangeStart: (_) => state.beginNoiseGateDrag(),
+                onChangeEnd: (_) => state.commitNoiseGateSoon(),
               ),
             ),
             Text(state.noiseGateHint, style: AppTextStyles.micLabel),
