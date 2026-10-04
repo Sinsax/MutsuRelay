@@ -1052,6 +1052,18 @@ exit_threshold = max(gate * VAD_HYSTERESIS, seg_noise_floor * VAD_EXIT_NOISE_RAT
 2. **interim 的 CPU 占用**：本轮只量了解码 RTF（0.012~0.017），没有量进程 CPU%。
 3. **小声说话（07_quiet 10.29%）**：这是当前 CER 的最大来源，方向应该是输入侧电平归一化。
 4. **Linux `.so` 重建 + 真机验证**（需 Linux 环境）。
-5. **CI**：`.github/workflows/build.yml.disabled` 仍是禁用状态（2026-06-10 起有意如此）。
-   启用只需改名，但启用前应先核对 Linux job 的 apt 包名（`fuse` / `locate` 在 ubuntu-24.04 上
-   已经不是这两个名字），否则第一次跑大概率红。
+5. **CI**：**已启用并跑通**。记录一下过程，因为第一次并不是全绿：
+   - 改名 `build.yml.disabled` → `build.yml`，顺手修掉 ubuntu-24.04 上已失效的 apt 包名
+     （`fuse` / `locate`）——两者其实都不需要；analyze job 增加 `check_abi.py`。
+   - **run #15**：analyze 绿、build-windows 绿（Inno Setup 改绝对路径调用后通过），
+     **build-linux 红在 `Create AppImage`**。对比历史：2026-06-02 与 2026-09-18 两次失败
+     也在 Linux 打包这一步 —— 是接手前就存在的问题。
+   - 根因：CI 走的是 `dart run fastforge:main package --platform linux --targets appimage`，
+     而仓库本地一直用 `tool/package.dart`（手工拼 AppRun/.desktop/icon → 直接调 appimagetool，
+     靠 `APPIMAGE_EXTRACT_AND_RUN=1` 绕开 FUSE）。同一份代码本地能出包、CI 不能，
+     差别就在这条路径上。
+   - 改法：Linux 打包步骤直接调 `dart run tool/package.dart`，CI 与本地同路径。
+   - **run #16：analyze / build-windows / build-linux 三个 job 全绿**，产出四个 artifact：
+     Windows ZIP 171 MB + 安装包 164 MB、Linux 便携 ZIP 175 MB + AppImage 166 MB。
+   - 附带收益：**Linux 侧的原生库这次由 CI 在 Linux 上真正重建并打进 AppImage**，
+     所以 §14.4 那条"需 Linux 环境"的欠账也一笔勾掉了（真机运行仍需你在 Linux 上验一次）。
