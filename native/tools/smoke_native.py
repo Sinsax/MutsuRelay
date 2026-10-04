@@ -126,6 +126,9 @@ def default_dll():
 
 
 def load(dll_path):
+    # add_dll_directory 只接受绝对路径（相对路径会抛 WinError 87），而 ctypes 的
+    # LoadLibrary 在 add_dll_directory 生效后也只能按绝对路径找依赖。
+    dll_path = os.path.abspath(dll_path)
     d = os.path.dirname(dll_path)
     if hasattr(os, "add_dll_directory"):
         os.add_dll_directory(d)
@@ -533,6 +536,31 @@ def main():
     (ok if r == 0 else warn)("load_config", f"返回 {r}")
     le = take(get_last_err())
     ok("get_last_error 可调用", repr(le)[:60])
+
+    # 段长上限 / interim 的往返（本轮新增的两项配置）。
+    # 先读原值，写测试值 → save → load → 断言，最后把原值写回去，
+    # 避免 smoke 测试顺手改掉用户真实 config.toml 里的设置。
+    orig_ms, orig_interim = get_seg_max(), get_interim()
+    if 1000 <= orig_ms <= 30000:
+        ok("段长上限在合法区间", f"{orig_ms}ms")
+    else:
+        bad("段长上限在合法区间", f"{orig_ms}ms")
+    set_seg_max(6000)
+    set_interim(0)
+    r_save = save_cfg()
+    (ok if r_save == 0 else bad)("save_config 返回 0", f"got {r_save}")
+    load_cfg()
+    if get_seg_max() == 6000 and get_interim() == 0:
+        ok("段长/interim 往返一致", "6000ms / off")
+    else:
+        bad("段长/interim 往返不一致", f"{get_seg_max()}ms / {get_interim()}")
+    set_seg_max(orig_ms)
+    set_interim(orig_interim)
+    save_cfg()
+    if get_seg_max() == orig_ms and get_interim() == orig_interim:
+        ok("已还原原设置", f"{orig_ms}ms / {'on' if orig_interim else 'off'}")
+    else:
+        warn("还原原设置", f"{get_seg_max()}ms / {get_interim()}（原 {orig_ms}ms）")
 
     # --- 8. 录音链路 ---
     print("\n[8] 录音链路")

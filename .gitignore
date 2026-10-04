@@ -73,3 +73,8 @@ error.txt
 
 # Build artifacts
 /dist/
+
+# 测试音频集：只提交脚本与参考文本（testdata/asr/ref/），
+# 音频本体由 native/tools/make_test_audio.ps1 + build_test_audio.py 本地生成。
+/testdata/asr/parts/
+/testdata/asr/wav/
