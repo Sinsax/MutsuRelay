@@ -11,7 +11,7 @@ class SettingsModal extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Selector<AppState, ({bool showSettings, bool cookieStatus, UserInfo? userInfo, bool asrRestarting, String asrLang, bool noiseSuppress, CensorMode censorMode, CloseBehavior closeBehavior})>(
+    return Selector<AppState, ({bool showSettings, bool cookieStatus, UserInfo? userInfo, bool asrRestarting, String asrLang, bool noiseSuppress, CensorMode censorMode, CloseBehavior closeBehavior, int segmentMaxMs, bool interim, Map<String, dynamic>? stats})>(
       selector: (_, state) => (
         showSettings: state.showSettings,
         cookieStatus: state.cookieStatus,
@@ -21,6 +21,9 @@ class SettingsModal extends StatelessWidget {
         noiseSuppress: state.noiseSuppress,
         censorMode: state.censorMode,
         closeBehavior: state.closeBehavior,
+        segmentMaxMs: state.segmentMaxMs,
+        interim: state.interim,
+        stats: state.asrStats,
       ),
       builder: (context, data, _) {
         final appState = context.read<AppState>();
@@ -87,6 +90,10 @@ class SettingsModal extends StatelessWidget {
                       _noiseRow(data, appState),
                       const SizedBox(height: 4),
                       _censorModeRow(data, appState),
+                      const SizedBox(height: 4),
+                      _segmentRow(data, appState),
+                      const SizedBox(height: 4),
+                      _interimRow(data, appState),
                       const SizedBox(height: 8),
                       _divider(),
                       const SizedBox(height: 8),
@@ -95,6 +102,8 @@ class SettingsModal extends StatelessWidget {
                       _dataDirRow(context),
                       const SizedBox(height: 4),
                       _closeBehaviorRow(data, appState),
+                      const SizedBox(height: 6),
+                      _statsRow(data),
                     ],
                     ),
                 ),
@@ -106,7 +115,7 @@ class SettingsModal extends StatelessWidget {
     );
   }
 
-  Widget _loggedInSection(({bool showSettings, bool cookieStatus, UserInfo? userInfo, bool asrRestarting, String asrLang, bool noiseSuppress, CensorMode censorMode, CloseBehavior closeBehavior}) data, AppState appState) {
+  Widget _loggedInSection(({bool showSettings, bool cookieStatus, UserInfo? userInfo, bool asrRestarting, String asrLang, bool noiseSuppress, CensorMode censorMode, CloseBehavior closeBehavior, int segmentMaxMs, bool interim, Map<String, dynamic>? stats}) data, AppState appState) {
     final bridge = NativeBridge.instance;
     return Container(
       padding: const EdgeInsets.symmetric(vertical: 2),
@@ -181,7 +190,7 @@ class SettingsModal extends StatelessWidget {
     );
   }
 
-  Widget _closeBehaviorRow(({bool showSettings, bool cookieStatus, UserInfo? userInfo, bool asrRestarting, String asrLang, bool noiseSuppress, CensorMode censorMode, CloseBehavior closeBehavior}) data, AppState appState) {
+  Widget _closeBehaviorRow(({bool showSettings, bool cookieStatus, UserInfo? userInfo, bool asrRestarting, String asrLang, bool noiseSuppress, CensorMode censorMode, CloseBehavior closeBehavior, int segmentMaxMs, bool interim, Map<String, dynamic>? stats}) data, AppState appState) {
     return _settingsRow(
       '关闭窗口时',
       _toggleGroup<CloseBehavior>(
@@ -192,7 +201,7 @@ class SettingsModal extends StatelessWidget {
     );
   }
 
-  Widget _censorModeRow(({bool showSettings, bool cookieStatus, UserInfo? userInfo, bool asrRestarting, String asrLang, bool noiseSuppress, CensorMode censorMode, CloseBehavior closeBehavior}) data, AppState appState) {
+  Widget _censorModeRow(({bool showSettings, bool cookieStatus, UserInfo? userInfo, bool asrRestarting, String asrLang, bool noiseSuppress, CensorMode censorMode, CloseBehavior closeBehavior, int segmentMaxMs, bool interim, Map<String, dynamic>? stats}) data, AppState appState) {
     return _settingsRow(
       '敏感词过滤',
       _toggleGroup<int>(
@@ -203,7 +212,74 @@ class SettingsModal extends StatelessWidget {
     );
   }
 
-  Widget _languageRow(({bool showSettings, bool cookieStatus, UserInfo? userInfo, bool asrRestarting, String asrLang, bool noiseSuppress, CensorMode censorMode, CloseBehavior closeBehavior}) data, AppState appState) {
+  /// 单段时长上限。它直接决定连续说话时的**最坏出字延迟**：
+  /// 8 s 上限意味着最坏情况要等 8 s 才整段出字（interim 只给半句预览）。
+  /// 改这个值只影响后续分段，不需要重启 ASR。
+  Widget _segmentRow(({bool showSettings, bool cookieStatus, UserInfo? userInfo, bool asrRestarting, String asrLang, bool noiseSuppress, CensorMode censorMode, CloseBehavior closeBehavior, int segmentMaxMs, bool interim, Map<String, dynamic>? stats}) data, AppState appState) {
+    return _settingsRow(
+      '单段上限',
+      _toggleGroup<int>(
+        [('4s', 4000), ('6s', 6000), ('8s', 8000), ('12s', 12000)],
+        data.segmentMaxMs,
+        (v) => appState.segmentMaxMs = v,
+      ),
+    );
+  }
+
+  /// interim（实时半句预览）开关。半句只进预览行，不写字幕、不自动发言。
+  Widget _interimRow(({bool showSettings, bool cookieStatus, UserInfo? userInfo, bool asrRestarting, String asrLang, bool noiseSuppress, CensorMode censorMode, CloseBehavior closeBehavior, int segmentMaxMs, bool interim, Map<String, dynamic>? stats}) data, AppState appState) {
+    return _settingsRow(
+      '实时预览',
+      _toggleGroup<bool>(
+        [('开', true), ('关', false)],
+        data.interim,
+        (v) => appState.interim = v,
+      ),
+    );
+  }
+
+  /// 运行统计。这几个数是排障入口，不是装饰：
+  /// - `asr_reloads`：调参时**不该涨**，涨了说明重建闸失效（CPU 与出字延迟会退化）；
+  /// - `dropped_segments`：段队列溢出丢最旧，涨了说明解码跟不上；
+  /// - `frontend_iter_max_ms`：采集线程单次迭代峰值，旧实现这里是 1.5~4 s。
+  Widget _statsRow(({bool showSettings, bool cookieStatus, UserInfo? userInfo, bool asrRestarting, String asrLang, bool noiseSuppress, CensorMode censorMode, CloseBehavior closeBehavior, int segmentMaxMs, bool interim, Map<String, dynamic>? stats}) data) {
+    final s = data.stats;
+    final String text;
+    if (s == null) {
+      text = '原生库未加载，暂无统计';
+    } else {
+      text = '重建 ${s['asr_reloads'] ?? 0}(省 ${s['asr_reload_skipped'] ?? 0}) · '
+          '丢段 ${s['dropped_segments'] ?? 0} · 丢样 ${s['dropped_samples'] ?? 0}\n'
+          '解码p50 ${s['decode_p50_ms'] ?? 0}ms · 段队列 ${s['seg_queue_depth'] ?? 0}'
+          ' · 采集峰值 ${s['frontend_iter_max_ms'] ?? 0}ms';
+    }
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            const Text('运行统计', style: AppTextStyles.settingsRow),
+            const Spacer(),
+            Text(
+              '每秒刷新',
+              style: TextStyle(fontSize: 9, color: AppColors.textMuted),
+            ),
+          ],
+        ),
+        const SizedBox(height: 2),
+        Text(
+          text,
+          style: TextStyle(
+            fontSize: 10,
+            height: 1.35,
+            color: AppColors.textMuted,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _languageRow(({bool showSettings, bool cookieStatus, UserInfo? userInfo, bool asrRestarting, String asrLang, bool noiseSuppress, CensorMode censorMode, CloseBehavior closeBehavior, int segmentMaxMs, bool interim, Map<String, dynamic>? stats}) data, AppState appState) {
     return _settingsRow(
       '识别语言',
       _toggleGroup<String>(
@@ -214,7 +290,7 @@ class SettingsModal extends StatelessWidget {
     );
   }
 
-  Widget _noiseRow(({bool showSettings, bool cookieStatus, UserInfo? userInfo, bool asrRestarting, String asrLang, bool noiseSuppress, CensorMode censorMode, CloseBehavior closeBehavior}) data, AppState appState) {
+  Widget _noiseRow(({bool showSettings, bool cookieStatus, UserInfo? userInfo, bool asrRestarting, String asrLang, bool noiseSuppress, CensorMode censorMode, CloseBehavior closeBehavior, int segmentMaxMs, bool interim, Map<String, dynamic>? stats}) data, AppState appState) {
     return Row(
       children: [
         Expanded(

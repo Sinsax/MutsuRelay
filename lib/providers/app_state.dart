@@ -283,11 +283,24 @@ class AppState extends ChangeNotifier {
     _showSettings = value;
     if (value) {
       _asrSettingsDirty = false;
-    } else if (_asrSettingsDirty) {
-      restartAsr();
+      // 统计只在面板打开期间刷新，关掉就停：避免常驻定时器。
+      refreshStats();
+      _statsTimer?.cancel();
+      _statsTimer = Timer.periodic(
+        const Duration(seconds: 1),
+        (_) => refreshStats(),
+      );
+    } else {
+      _statsTimer?.cancel();
+      _statsTimer = null;
+      if (_asrSettingsDirty) {
+        restartAsr();
+      }
     }
     notifyListeners();
   }
+
+  Timer? _statsTimer;
 
   bool _showQrLogin = false;
   bool get showQrLogin => _showQrLogin;
@@ -342,6 +355,42 @@ class AppState extends ChangeNotifier {
     NativeBridge.instance.setNoiseSuppress(value);
     notifyListeners();
     saveSettings();
+  }
+
+  // ---- 分段参数（Rust 侧 P3 就有、绑定也有，此前界面一直没接）----
+  int _segmentMaxMs = 8000;
+  int get segmentMaxMs => _segmentMaxMs;
+  set segmentMaxMs(int value) {
+    final v = value.clamp(1000, 30000);
+    if (v == _segmentMaxMs) return;
+    _segmentMaxMs = v;
+    // 段长只影响**后续**分段，不触碰 recognizer：所以这里刻意不置
+    // `_asrSettingsDirty` —— 否则关掉设置窗会白白重载一次 229 MB 模型
+    // （一次重建 ≈ 2 s，期间解码线程停摆、段队列丢最旧）。
+    NativeBridge.instance.setSegmentMaxMs(v);
+    notifyListeners();
+    saveSettings();
+  }
+
+  bool _interim = true;
+  bool get interim => _interim;
+  set interim(bool value) {
+    if (value == _interim) return;
+    _interim = value;
+    NativeBridge.instance.setInterim(value);
+    notifyListeners();
+    saveSettings();
+  }
+
+  /// 运行统计快照（只在设置面板打开期间刷新，见 [showSettings]）。
+  Map<String, dynamic>? _asrStats;
+  Map<String, dynamic>? get asrStats => _asrStats;
+
+  void refreshStats() {
+    final s = NativeBridge.instance.getStats();
+    if (s == null) return;
+    _asrStats = s;
+    notifyListeners();
   }
 
   bool _asrRestarting = false;
@@ -780,6 +829,9 @@ class AppState extends ChangeNotifier {
       if (cb != null && cb.isNotEmpty) {
         _closeBehavior = cb == 'exit' ? CloseBehavior.exit : CloseBehavior.hide;
       }
+
+      _segmentMaxMs = bridge.getSegmentMaxMs().clamp(1000, 30000);
+      _interim = bridge.getInterim();
 
       final configDir = bridge.getConfigDirPath();
       if (configDir != null) {
