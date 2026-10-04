@@ -155,10 +155,14 @@ jobs:
         run: flutter build linux --release
 
       - name: Create AppImage
-        run: dart run fastforge:main package --platform linux --targets appimage
+        # 用仓库自己的打包脚本，不再另起一条 fastforge 路径：本地
+        # `dart run tool/package.dart` 就是这么打的（手工拼 AppRun/.desktop/icon →
+        # appimagetool，靠 APPIMAGE_EXTRACT_AND_RUN=1 绕开 FUSE 依赖）。
+        # 历史上 2026-06-02 与 2026-09-18 两次 CI 失败都停在 fastforge 那一步，
+        # 而同一份代码在本地脚本下能正常出包。
+        run: dart run tool/package.dart
         env:
           APPIMAGE_EXTRACT_AND_RUN: 1
-          LD_LIBRARY_PATH: build/linux/x64/release/bundle/lib
 
       - name: Create Linux portable ZIP
         run: |

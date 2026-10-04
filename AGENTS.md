@@ -50,7 +50,9 @@ python native/tools/cer_baseline.py --only 07_quiet --no-denoise   # 单片段 A
   not parallel), and `v*` tags publish a Release. To disable it again, rename the file to
   `build.yml.disabled` (that is how it was parked on 2026-06-10). Note ubuntu-24.04 package names:
   `fuse`/`locate` no longer exist — the Linux job deliberately installs neither and runs
-  appimagetool with `APPIMAGE_EXTRACT_AND_RUN=1`.
+  appimagetool with `APPIMAGE_EXTRACT_AND_RUN=1`. The Linux packaging step calls the repo's own
+  `dart run tool/package.dart` (manual AppDir + appimagetool) — CI and local packaging must stay the
+  same path; the old fastforge invocation failed on every run (2026-06-02, 2026-09-18).
 - Version single source of truth: `version:` in `pubspec.yaml`.
 
 ## C API versioning (important)
