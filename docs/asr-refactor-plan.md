@@ -528,6 +528,11 @@ Dart 侧据 `final` 字段把半句渲染到实时预览行，不进句列表。
 
 ### 9.4 尚未验证 / 遗留
 
+> **以下五项已在本轮（第十四节）逐条处理**，保留原文以便对照当时的判断：
+> ①仍待真机实测；②**已完成**（§14.1 测试音频集 + CER 基线）；③**本机侧已完成**（§14.4：源码级
+> ABI 校验 + 清理死符号链接；Linux 产物仍需在 Linux 上重建）；④**已完成**（§14.3 段长/ interim
+> 接进设置界面并持久化）；⑤仍待实测（§14.1 只量了解码 RTF，未量 CPU 占用）。
+
 1. **真机端到端录音识别**：需要能跑 Flutter 的环境。目前所有"精度提升"只有单测与代码级支撑。
 2. **CER / 首字延迟实测**：`replay.rs` 已就绪，但**测试音频集没做**——没有它，5.2 节的精度预期仍是主观判断。
 3. **`mutsurelay_abi_version` 的跨平台回归**：Linux 侧的 `.so` 必须重新构建，否则会因为版本不符被明确拒绝（这是设计意图，不是 bug）。
@@ -926,3 +931,127 @@ exit_threshold = max(gate * VAD_HYSTERESIS, seg_noise_floor * VAD_EXIT_NOISE_RAT
 - interim 间隔 **0.8 s**、窗口 **3 s**（实测解码 73 ms，CPU 代价约 5%，且仅在持续说话时）。
 - 关闭窗口：**先隐藏再收尾**，不再试图让进程"秒退"（进程收尾本身仍要几百毫秒，
   只是用户看不见了）。
+
+---
+
+## 十四、第五轮：清账 + 测试音频集 + 参数接界面
+
+本轮把 §9.4 与 §10.3 挂着的账一次结清，并把"精度只能靠耳朵听"变成可复现的数字。
+**本轮没有增删任何 `mutsurelay_*` 导出符号，ABI 保持 2**（只新增了 `Stats` 里一个字段的输出）。
+
+### 14.1 测试音频集 + CER 基线（P0 的最后一块）
+
+`replay.rs` 早就就绪，缺的只是音频集。现在补上，且**全流程可复现**：
+
+| 组件 | 文件 | 说明 |
+|---|---|---|
+| 参考文本 | `testdata/asr/ref/*.txt` | 6 段中文，逐行一句；入库 |
+| TTS 合成 | `native/tools/make_test_audio.ps1` | Windows SAPI（zh-CN），逐行合成 16 kHz 单声道 WAV |
+| 拼装 + 噪声 | `native/tools/build_test_audio.py` | 句间静音 / 增益 / 风扇+键盘噪声，固定随机种子（默认 20260918） |
+| 基线 | `native/tools/cer_baseline.py` → `docs/asr-baseline.md` | 10 个片段：CER / 段数 / 解码 p50-p95 / RTF |
+
+**为什么逐行合成**：TTS 在句号处的停顿只有几百毫秒且不可控，而"长停顿能否判停"正是分段器的
+关键用例。逐行合成 + 可控句间静音（0.15 / 0.45 / 0.9 / 1.5 s）才测得出来。
+音频本体（约 6.6 分钟）不入库，`.gitignore` 掉 `testdata/asr/{parts,wav}/`。
+
+**基线数字**（2026-10-05，debug 产物，音频合计 397.8 s，开关 denoise=on/preroll=on/seg_max=8000）：
+
+| 片段 | CER | 段数 | 解码 p50 | RTF |
+|---|---|---|---|---|
+| 01_continuous（句间 0.15 s） | 2.74% | 19 | 48 ms | 0.016 |
+| 02_pauses（句间 1.5 s） | 2.52% | 15 | 40 ms | 0.013 |
+| 03_reading | 1.47% | 13 | 47 ms | 0.016 |
+| 04_sensitive（含屏蔽词） | 0.00% | 12 | 47 ms | 0.016 |
+| 05_fast（rate +6） | 3.03% | 4 | 45 ms | 0.015 |
+| 06_slow（rate −4） | 3.12% | 6 | 60 ms | 0.012 |
+| **07_quiet（−12 dB）** | **10.29%** | 17 | 37 ms | 0.017 |
+| 08_loud（+6 dB，709 样本削顶） | 1.47% | 13 | 47 ms | 0.016 |
+| 09_noisy（SNR 18 dB） | 2.52% | 13 | 53 ms | 0.016 |
+| 10_very_noisy（SNR 10 dB） | 4.20% | 13 | 59 ms | 0.016 |
+| **平均** | **3.14%** | 125 | — | ≈0.015 |
+
+三条结论：
+
+1. **解码依然不是瓶颈**：RTF 0.012~0.017（≈60~80× 实时），与 §12.5 的 bench 结论一致。
+   以后遇到"出字慢"，查 `asr_reloads` / `dropped_segments` / 分段判停，别再压解码耗时。
+2. **小声说话是真正的短板**：同一段音频、同一份参考文本，−12 dB 之后 CER 从 1.47% 涨到
+   **10.29%**。这不是模型能力问题，而是"输入电平低 → 端到端整体劣化"。
+   若要继续压 CER，该动的是**电平归一化 / 自动增益**，而不是继续调门限 ——
+   门限只能决定"切不切"，补不了电平。
+3. **噪声下退化温和**：SNR 10 dB 才 4.20%，且 09/10 分别只有 1 段 / 0 段被判丢。
+
+> 绝对 CER 只是"这台机器 + 这份 TTS 音频集"的刻度，**不是**真实人声准确率；
+> 但同一份音频集上的前后对比有效 —— 这才是它的用途。
+
+### 14.2 清掉 §10.3 的六项技术债
+
+| 项 | 处理 |
+|---|---|
+| `AudioRing::buffer() -> &mut [f32]` 的别名假设 | **改为裸指针**：`Box::into_raw` 持有 + `ptr::copy_nonoverlapping` 读写 + `Drop` 还原成 `Box`。两个线程不再各自构造覆盖整块的 `&mut [f32]`，Stacked/Tree Borrows 下的无效引用消失；代价是显式写 `unsafe impl Send/Sync`（安全性依赖原有的 head/tail 协议，注释里写清了） |
+| `Ctl::Flush` 只打一行日志 | **删除**：`Ctl` 变体、`AsrEngine::flush`、解码线程的处理分支、`lib.rs` 的调用点全部移除。收尾路径本来就靠 `segmenter.flush` → `submit_segment` 把尾段交出去，不依赖这个空操作 |
+| `TextPipeline::accept(.., is_final)` 恒传 `true` | **删掉参数**，函数默认即 final 语义，并在文档注释里写明"interim 在 `decode_batch` 更早就分流了，绝不能进这里污染去重窗口"。原 `interim_does_not_touch_dedup_state` 测试改为 `final_stage_dedups_within_window` |
+| `Stats::frontend_iter_max_ms` 写后不读 | **接进 stats 输出**（`frontend_iter_max_ms`），它正是 P2 的核心判据 |
+| `StreamResampler::group_delay_samples` 从未被调用 | 删除 |
+| `Segmenter::processed_ms` 只出现在测试里 | 删除（`reset` 的断言已由 `current_segment_ms()==0` 与 `!in_speech()` 覆盖；内部仍用 `processed_samples` 算 onset） |
+
+**有意保留的两项**（§10.3 当时也这么判断，本轮复核后维持）：
+
+- `mutsurelay_send_message`：导出仍在、Dart 不绑定。留着是为了不因为一个死符号动 ABI 版本；
+  真正的发送路径是 `enqueue_message` + net 线程。
+- 停止 → 1~3 s 内重启会丢上一代尾段：这是"防止旧音频污染新一轮"的有意代价。要改就得给尾段加
+  "允许跨代"标记，收益小、风险实在，暂不动。
+
+### 14.3 段长上限 / interim / 运行统计接进设置界面
+
+三样东西 Rust 侧与 Dart 绑定**一直都有**，只是从没接过界面（§9.4 #4）。本轮接上，并补了持久化：
+
+| 改动 | 位置 |
+|---|---|
+| `config.toml` 新增 `segment_max_ms`（默认 8000）与 `interim`（默认 true），serde 默认值兼容旧配置 | `bilive.rs:Config` |
+| `save_config` / `load_config` 读写这两个静态量；**load 路径刻意不触发重建**（它们不影响 recognizer） | `lib.rs` |
+| 设置界面新增「单段上限」（4/6/8/12 s）与「实时预览」（开/关）两行 | `settings_modal.dart` |
+| 「运行统计」面板：`asr_reloads(省 skipped)` / `dropped_segments` / `dropped_samples` / `decode_p50_ms` / `seg_queue_depth` / `frontend_iter_max_ms` | 同上 + `app_state.dart:refreshStats()` |
+| 统计只在设置面板打开期间用 1 s 定时器刷新，关掉即取消（不留常驻定时器） | `app_state.dart:showSettings` |
+
+一个容易踩的坑：**改段长/ interim 不能置 `_asrSettingsDirty`**。那个标志位的唯一作用是"关设置窗时
+重载 recognizer"，而重载一次 = 229 MB 模型 + 解码线程停摆 ≈ 2 s。段长只影响后续分段，
+所以这两个 setter 只写静态量 + 存配置。
+
+### 14.4 Linux 侧：本机能做的部分
+
+本机没有可用的 WSL 发行版，Linux 产物**无法**在这里重建。能做的都做了：
+
+- **新增源码级 ABI 一致性校验** `native/tools/check_abi.py`：解析 `lib.rs:ABI_VERSION` 与
+  `native_bridge.dart:expectedAbiVersion` 并断言相等（不需要编译产物、不需要 DLL），
+  当前 `2 / 2 一致`。这是"双系统拿错产物 → 静默退回 mock"的第一道闸。
+- **清掉仓库根的死符号链接** `libmutsurelay_native.so`：它指向旧工程
+  `/home/para/ntfs/F/para/Code/mutsurelay_flutter/...`，在 Windows 上是断链，在 Linux 上也指错
+  项目（真正该用的是 `native/target/{debug,release}/libmutsurelay_native.so`，而
+  `_defaultLibraryPath()` 的候选列表里本来就有这两条）。它没有被 git 跟踪（`.gitignore` 里 `*.so`）。
+- **仍需在 Linux 上做的**：`bash native/build.sh` 重建 `.so`（ABI=2）。在重建之前，
+  Linux 侧跑新绑定会明确报"ABI 不符，请在本平台重新构建" —— 这是设计意图，不是 bug。
+
+### 14.5 本轮验证
+
+| 项 | 结果 |
+|---|---|
+| `cargo check --all-targets` | 通过，无警告 |
+| `cargo test` | **67 passed / 0 failed**（删除/改名各一，总数不变） |
+| `check_abi.py` | dll=2 / dart=2 一致 |
+| `smoke_native.py` | **55 PASS / 0 FAIL / 0 WARN**（+4：段长上限区间、save 返回 0、段长/interim 往返、还原原设置） |
+| `cer_baseline.py` | 10 片段 / 397.8 s / **平均 CER 3.14%**，详见 `docs/asr-baseline.md` |
+| `flutter analyze` | No issues found |
+| `flutter test` | 2 passed（双击复制 + 主界面渲染） |
+| 录音链路（冒烟内） | 3 s 采到 456 chunks、`dropped_samples=0`；3 轮起停累计 597 chunks |
+| ABI | dll=2 / dart=2（本轮未增删导出符号） |
+
+### 14.6 仍未完成（明确留给下一轮）
+
+1. **真机端到端**：段长/ interim/ 统计现在有界面了，但"改了之后真机感受如何"必须由用户实测
+   （尤其 4 s 段长对延迟的改善、以及 `asr_reloads` 在拖动滑块时是否真的不涨）。
+2. **interim 的 CPU 占用**：本轮只量了解码 RTF（0.012~0.017），没有量进程 CPU%。
+3. **小声说话（07_quiet 10.29%）**：这是当前 CER 的最大来源，方向应该是输入侧电平归一化。
+4. **Linux `.so` 重建 + 真机验证**（需 Linux 环境）。
+5. **CI**：`.github/workflows/build.yml.disabled` 仍是禁用状态（2026-06-10 起有意如此）。
+   启用只需改名，但启用前应先核对 Linux job 的 apt 包名（`fuse` / `locate` 在 ubuntu-24.04 上
+   已经不是这两个名字），否则第一次跑大概率红。

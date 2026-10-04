@@ -11,12 +11,28 @@ dart run tool/build_and_run.dart        # fastest dev loop: Rust build + flutter
 dart run tool/package.dart              # builds release + AppImage + tar.gz (Linux) or Inno Setup + ZIP (Windows)
 native/build.sh                        # cargo build + copy .so to linux/mutsurelay_native
 native/build.ps1                       # same for .dll → windows/mutsurelay_native
-cargo test                             # 59 Rust unit tests (censor/audio/segmenter/text/asr)
+cargo test                             # 67 Rust unit tests (censor/audio/segmenter/text/asr)
 cargo check --all-targets              # fast Rust compile check (includes examples/ + tests)
 cargo run --example replay -- --help   # offline replay + CER, for accuracy A/B on a WAV
 python native/tools/smoke_native.py    # runtime smoke test of the C API (works without Flutter)
+python native/tools/check_abi.py       # ABI 版本两端一致性（纯源码，提交前跑，不用编译）
+python native/tools/cer_baseline.py    # 在测试音频集上跑 replay → docs/asr-baseline.md（CER 基线）
 flutter clean                          # fix stale C++ build cache after Dart-only changes
 ```
+
+测试音频集（CER 基线的前提，音频本体不入库）：
+
+```sh
+powershell -NoProfile -ExecutionPolicy Bypass -File native/tools/make_test_audio.ps1  # TTS 逐句合成（需 zh-CN 语音）
+python native/tools/build_test_audio.py          # 拼句间静音 + 增益/噪声变体 → testdata/asr/wav/
+python native/tools/cer_baseline.py              # 全部片段跑一遍，写 docs/asr-baseline.md
+python native/tools/cer_baseline.py --only 07_quiet --no-denoise   # 单片段 A/B
+```
+
+- **`make_test_audio.ps1` 必须保存为「UTF-8 with BOM」**：Windows PowerShell 5.1 会把无 BOM 的
+  `.ps1` 按 ANSI(GBK) 解码，中文注释里的字节会吃掉字符串的结束引号，报
+  `字符串缺少终止符` / `UnexpectedToken` 这类看不出原因的解析错误。用 `write` 工具重写该文件后
+  记得补回 BOM（`python -c "import io;p='native/tools/make_test_audio.ps1';io.open(p,'w',encoding='utf-8-sig',newline='\r\n').write(io.open(p,encoding='utf-8').read())"`）。
 
 - Linux uses `fvm flutter …` (`fvm` is on PATH there); Windows has no fvm — use plain `flutter`.
 - **Windows: Flutter is at `C:\Users\para\flutter\flutter\bin` and is NOT on PATH** (the PATH entry
@@ -131,6 +147,9 @@ The reload happens in the background, so `reloadAsr()` returns immediately; poll
 - `saveConfig()` reads Rust statics, writes `config.toml`. `loadConfig()` reads `config.toml`, restores statics.
 - `loadConfig()` also triggers an ASR reload (it may change language/model dir).
 - `asrLang` setter does NOT call `bridge.setAsrLang` directly — relies on `saveSettings()` to batch it. Different from `censorMode`/`noiseSuppress` which call native immediately + save.
+- `config.toml` 还有 `segment_max_ms`（单段上限，默认 8000）与 `interim`（实时半句，默认 true）：
+  两者在 `mutsurelay_save_config`/`load_config` 里读写 `SEGMENT_MAX_MS` / `INTERIM_ENABLED` 静态量。
+  **它们不需要重建 recognizer**，所以 load 路径故意不碰 `trigger_reload*()`。
 - `loadSettings()` must call `bridge.setSubtitleFilePath()` or Rust `SUBTITLE_FILE_PATH` stays empty and `capture.txt` is never written.
 
 ### Sending
@@ -146,7 +165,12 @@ The reload happens in the background, so `reloadAsr()` returns immediately; poll
 
 ## Dart gotchas
 
-- Settings modal: `Stack` overlay via `_showSettings` bool. `showSettings = false` auto-calls `restartAsr()`.
+- Settings modal: `Stack` overlay via `_showSettings` bool. Closing it calls `restartAsr()` **only when
+  `_asrSettingsDirty`** — i.e. only for changes that really need a new recognizer (language / model /
+  censor / noise suppress). 段长上限与 interim 只影响后续分段，刻意**不**置脏，否则关一次设置窗就
+  白重载一次 229 MB 模型。
+- 设置面板里的「运行统计」由 `AppState.showSettings` 打开时启动的 1 s 定时器刷新，关掉即取消
+  （`getStats()` 取 `mutsurelay_get_stats`）。判据：调参时 `asr_reloads` 不该涨。
 - Recording poll (50 ms) drains the whole result batch. Items with `final: false` are **interim preview** → update `_liveText` only; never `addSentence()` them (that would also trigger auto-send).
 - Stopping does **not** cancel the poll immediately — there's a ~3 s grace period to collect the last flushed segment, otherwise every stop drops the final sentence.
 - Sends go through `_dispatchSend()` → `enqueueMessage()` and are collected by `_drainSendResults()` (150 ms timer that stops itself when idle). Don't call anything blocking from the UI thread.
