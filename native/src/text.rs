@@ -200,7 +200,11 @@ impl TextPipeline {
     ///
     /// `seam_overlap_ms` > 0 表示本段的起始音频与上一段结尾重叠（强制切段造成），
     /// 这时才做前缀去重，避免误删正常的重复语句。
-    pub fn accept(&mut self, raw: &str, seam_overlap_ms: u32, is_final: bool) -> Option<String> {
+    ///
+    /// **只处理正式段**。interim（实时半句）在 `asr::decode_batch` 更早处就分流了 ——
+    /// 它不写字幕、不触发发言，也**绝不能碰这里的去重状态**（否则半句会污染正式结果的
+    /// 去重窗口）。因此本函数没有 `is_final` 参数：它默认就是 final 语义。
+    pub fn accept(&mut self, raw: &str, seam_overlap_ms: u32) -> Option<String> {
         let cleaned = clean(raw);
         if cleaned.is_empty() {
             self.rejected_short += 1;
@@ -217,7 +221,7 @@ impl TextPipeline {
         }
 
         let mut text = cleaned;
-        if is_final && seam_overlap_ms > 0 && !self.last_final.is_empty() {
+        if seam_overlap_ms > 0 && !self.last_final.is_empty() {
             let trimmed = trim_seam_overlap(&self.last_final, &text);
             if trimmed != text {
                 self.seam_trimmed += 1;
@@ -231,16 +235,14 @@ impl TextPipeline {
             return None;
         }
 
-        if is_final {
-            if let Some((prev, at)) = &self.last_dedup {
-                if *prev == norm && at.elapsed() < self.dedup_window {
-                    self.rejected_dup += 1;
-                    return None;
-                }
+        if let Some((prev, at)) = &self.last_dedup {
+            if *prev == norm && at.elapsed() < self.dedup_window {
+                self.rejected_dup += 1;
+                return None;
             }
-            self.last_dedup = Some((norm, Instant::now()));
-            self.last_final = text.clone();
         }
+        self.last_dedup = Some((norm, Instant::now()));
+        self.last_final = text.clone();
 
         Some(text)
     }
@@ -373,42 +375,43 @@ mod tests {
     #[test]
     fn pipeline_rejects_short_and_repetitive() {
         let mut p = TextPipeline::default();
-        assert!(p.accept("啊", 0, true).is_none());
-        assert!(p.accept("好好好好好好", 0, true).is_none());
-        assert!(p.accept("今天天气不错", 0, true).is_some());
+        assert!(p.accept("啊", 0).is_none());
+        assert!(p.accept("好好好好好好", 0).is_none());
+        assert!(p.accept("今天天气不错", 0).is_some());
     }
 
     #[test]
     fn pipeline_dedups_within_window() {
         let mut p = TextPipeline::new(Duration::from_millis(50));
-        assert!(p.accept("今天天气不错", 0, true).is_some());
+        assert!(p.accept("今天天气不错", 0).is_some());
         // 只差一个逗号也应被认作重复（比较归一化文本）
-        assert!(p.accept("今天天气不错，", 0, true).is_none());
+        assert!(p.accept("今天天气不错，", 0).is_none());
         std::thread::sleep(Duration::from_millis(80));
-        assert!(p.accept("今天天气不错", 0, true).is_some(), "超出窗口应放行");
+        assert!(p.accept("今天天气不错", 0).is_some(), "超出窗口应放行");
     }
 
     #[test]
     fn pipeline_applies_seam_trim_only_when_marked() {
         let mut p = TextPipeline::new(Duration::from_millis(0));
-        p.accept("今天天气不错我们出去走走", 0, true);
+        p.accept("今天天气不错我们出去走走", 0);
         // 标记了接缝重叠 → 去掉重复前缀
-        let got = p.accept("我们出去走走然后吃饭", 300, true).unwrap();
+        let got = p.accept("我们出去走走然后吃饭", 300).unwrap();
         assert_eq!(got, "然后吃饭");
 
         let mut p2 = TextPipeline::new(Duration::from_millis(0));
-        p2.accept("今天天气不错我们出去走走", 0, true);
+        p2.accept("今天天气不错我们出去走走", 0);
         // 未标记 → 原样保留（可能是正常的复述）
-        let got2 = p2.accept("我们出去走走然后吃饭", 0, true).unwrap();
+        let got2 = p2.accept("我们出去走走然后吃饭", 0).unwrap();
         assert_eq!(got2, "我们出去走走然后吃饭");
     }
 
     #[test]
-    fn interim_does_not_touch_dedup_state() {
+    fn final_stage_dedups_within_window() {
+        // interim 不再走 `accept`（它在 asr::decode_batch 就被分流），所以这里只钉
+        // final 语义：窗口内的复述被吞掉，超出窗口才放行。
         let mut p = TextPipeline::default();
-        assert!(p.accept("今天天气", 0, false).is_some());
-        assert!(p.accept("今天天气", 0, false).is_some(), "interim 不去重");
-        assert!(p.accept("今天天气", 0, true).is_some(), "interim 不应污染 final 去重状态");
+        assert!(p.accept("今天天气", 0).is_some());
+        assert!(p.accept("今天天气", 0).is_none(), "窗口内的复述应被去重");
     }
 
     #[test]

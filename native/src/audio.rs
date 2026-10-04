@@ -4,7 +4,6 @@
 //! 不允许分配、不允许加锁、不允许阻塞。它只做两件 O(n) 的纯计算：写入环形缓冲、
 //! 以及（调用方在进入之前完成的）单声道下混。
 
-use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const ASR_SAMPLE_RATE: u32 = 16_000;
@@ -35,10 +34,15 @@ pub fn peak(samples: &[f32]) -> f32 {
 /// 多处理一段稍旧但连续的音频（处理速度远快于实时，很快就能追上）；换来的是**完全
 /// 无竞态**——每个原子量都只有一个写入方。丢样数量记在 `dropped()` 里，可观测。
 pub struct AudioRing {
-    /// 用 `UnsafeCell` 包裹缓冲区：push/pop 都只能拿到 `&self`（两个线程各持一个
-    /// `Arc<AudioRing>`），靠 head/tail 的 acquire/release 语义保证同一个槽位不会
-    /// 被两个线程同时访问——生产者只写"head 之后"的槽，消费者只读"tail 之前"的槽。
-    buf: UnsafeCell<Box<[f32]>>,
+    /// 缓冲区**裸指针**（`Box::into_raw` 得到，`Drop` 时用 `Box::from_raw` 还原）。
+    ///
+    /// 刻意不用 `UnsafeCell<Box<[f32]>>`：那样 push/pop 各自会从 `UnsafeCell` 造出
+    /// 覆盖**整个缓冲区**的 `&mut [f32]`。两段字节区间不相交因而**不是数据竞争**，
+    /// 但两个 `&mut` 同时存活按 Stacked/Tree Borrows 是无效引用，LLVM 的 `noalias`
+    /// 有理论优化风险。裸指针 + `ptr::copy_nonoverlapping` 不构造任何这种引用。
+    ptr: *mut f32,
+    /// 缓冲区长度（已向上取整到 2 的幂）
+    cap: usize,
     /// capacity - 1，capacity 必须是 2 的幂
     mask: u64,
     /// 生产者：已写入的样本总数（单调递增，不取模）
@@ -52,8 +56,11 @@ impl AudioRing {
     /// `capacity` 会向上取整到 2 的幂。
     pub fn new(capacity: usize) -> Self {
         let cap = capacity.next_power_of_two().max(1024);
+        let boxed: Box<[f32]> = vec![0.0; cap].into_boxed_slice();
         Self {
-            buf: UnsafeCell::new(vec![0.0; cap].into_boxed_slice()),
+            // 所有权交给裸指针，生命周期由下面的 Drop 负责
+            ptr: Box::into_raw(boxed) as *mut f32,
+            cap,
             mask: (cap as u64) - 1,
             head: AtomicU64::new(0),
             tail: AtomicU64::new(0),
@@ -62,13 +69,7 @@ impl AudioRing {
     }
 
     pub fn capacity(&self) -> usize {
-        self.mask as usize + 1
-    }
-
-    /// 拿到缓冲区。安全性依据见 `buf` 字段的说明。
-    #[inline]
-    fn buffer(&self) -> &mut [f32] {
-        unsafe { &mut *self.buf.get() }
+        self.cap
     }
 
     /// 当前可读样本数。
@@ -104,13 +105,17 @@ impl AudioRing {
             self.dropped.fetch_add(data.len() as u64, Ordering::Relaxed);
             return;
         }
-        let buf = self.buffer();
         let start = (h & self.mask) as usize;
-        // 环形写入：可能跨越末尾，拆成两段
-        let first = n.min(buf.len() - start);
-        buf[start..start + first].copy_from_slice(&data[..first]);
-        if first < n {
-            buf[..n - first].copy_from_slice(&data[first..n]);
+        // 环形写入：可能跨越末尾，拆成两段。裸指针直接拷，不构造 &mut [f32]。
+        // SAFETY: 生产者只写 [head, head+n) 这段槽位，消费者只读 [tail, head)，
+        // 两者按 head/tail 的 acquire/release 协议永不相交；且 start + n <= cap
+        // （n <= space <= mask - used，由上面的 space 计算保证）。
+        unsafe {
+            let first = n.min(self.cap - start);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.add(start), first);
+            if first < n {
+                std::ptr::copy_nonoverlapping(data.as_ptr().add(first), self.ptr, n - first);
+            }
         }
         // Release：确保上面写入的样本对消费者可见
         self.head.store(h.wrapping_add(n as u64), Ordering::Release);
@@ -134,12 +139,23 @@ impl AudioRing {
         if n == 0 {
             return 0;
         }
-        let buf = self.buffer();
         let start = (t & self.mask) as usize;
-        let first = n.min(buf.len() - start);
-        out[..first].copy_from_slice(&buf[start..start + first]);
-        if first < n {
-            out[first..n].copy_from_slice(&buf[..n - first]);
+        // SAFETY: 与 push_slice 对偶——消费者只读 [tail, tail+n) 这段槽位，
+        // 生产者只写 [head, ...)；且 start + n <= cap。
+        unsafe {
+            let first = n.min(self.cap - start);
+            std::ptr::copy_nonoverlapping(
+                self.ptr.add(start) as *const f32,
+                out.as_mut_ptr(),
+                first,
+            );
+            if first < n {
+                std::ptr::copy_nonoverlapping(
+                    self.ptr as *const f32,
+                    out.as_mut_ptr().add(first),
+                    n - first,
+                );
+            }
         }
         // Release：告知生产者这些槽可以复用了
         self.tail.store(t.wrapping_add(n as u64), Ordering::Release);
@@ -147,8 +163,22 @@ impl AudioRing {
     }
 }
 
-// 缓冲区本身是 Send，但 UnsafeCell 使 AudioRing 不再是 Sync；
-// 跨线程安全由上面描述的 head/tail 协议保证。
+impl Drop for AudioRing {
+    fn drop(&mut self) {
+        // SAFETY: ptr 来自 new() 的 Box::into_raw，且此 Drop 只会执行一次；
+        // 还原成 Box<[f32]> 后由 Box 自己释放。
+        unsafe {
+            drop(Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+                self.ptr, self.cap,
+            )));
+        }
+    }
+}
+
+// 裸指针本身不是 Send/Sync，这里的承诺是：跨线程安全完全由上面描述的 head/tail
+// 协议建立（生产者只写 head 之后、消费者只读 tail 之前，同一槽位不会被两个线程
+// 同时访问）。除这两个原子量外没有别的共享可变状态。
+unsafe impl Send for AudioRing {}
 unsafe impl Sync for AudioRing {}
 
 // ---------------------------------------------------------------- 流式重采样
@@ -239,11 +269,6 @@ impl StreamResampler {
 
     pub fn is_passthrough(&self) -> bool {
         (self.ratio - 1.0).abs() < 1e-9
-    }
-
-    /// 低通滤波的群延迟（样本数，输入采样率下），仅用于说明，不影响功能。
-    pub fn group_delay_samples(&self) -> usize {
-        self.fir.len() / 2
     }
 
     fn at(&self, abs: i64) -> f32 {

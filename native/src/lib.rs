@@ -490,7 +490,6 @@ fn frontend_loop(
     asr::stats()
         .dropped_samples
         .fetch_add(ring.dropped(), Ordering::Relaxed);
-    engine().flush(token);
     audio_level().store(f32::to_bits(0.0), Ordering::Relaxed);
     in_speech_state().store(false, Ordering::Relaxed);
     log::info!("[rust] front-end stopped (token={token})");
@@ -708,6 +707,8 @@ fn stats_json() -> serde_json::Value {
         "frontend_avg_ms": s.frontend.avg(),
         "frontend_p95_ms": s.frontend.percentile(0.95),
         "frontend_max_ms": s.frontend.max(),
+        // P2 的核心判据：旧实现在这里会看到 1.5~4 s（阻塞解码在帧循环里）。
+        "frontend_iter_max_ms": s.frontend_iter_max_ms.load(Ordering::Relaxed),
         "frontend_iters": s.frontend_iter_count.load(Ordering::Relaxed),
     })
 }
@@ -1060,6 +1061,8 @@ pub extern "C" fn mutsurelay_save_config() -> i32 {
     cfg.language = bilive::get_language();
     cfg.close_behavior = bilive::get_close_behavior();
     cfg.subtitle_file_path = bilive::get_subtitle_file_path();
+    cfg.segment_max_ms = SEGMENT_MAX_MS.load(Ordering::SeqCst);
+    cfg.interim = INTERIM_ENABLED.load(Ordering::SeqCst);
     cfg.save().map(|_| 0).unwrap_or(-1)
 }
 
@@ -1080,6 +1083,9 @@ pub extern "C" fn mutsurelay_load_config() -> i32 {
                 bilive::set_room_id(cfg.roomid);
             }
             bilive::set_subtitle_file_path(&cfg.subtitle_file_path);
+            // 段长 / interim 只影响后续分段，不需要重建 recognizer（也不要触发它）。
+            SEGMENT_MAX_MS.store(cfg.segment_max_ms.clamp(1000, 30_000), Ordering::SeqCst);
+            INTERIM_ENABLED.store(cfg.interim, Ordering::SeqCst);
             bilive::init_from_config(&cfg);
             if let Ok(mut a) = asr_lang().lock() {
                 *a = bilive::get_language();

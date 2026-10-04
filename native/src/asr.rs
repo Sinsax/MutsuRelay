@@ -194,8 +194,6 @@ pub struct SegmentJob {
 pub enum Ctl {
     /// 重建 recognizer（换模型 / 换语言）。空闲时即等同预热。
     Reload { model_dir: String, lang: String },
-    /// 保证此前提交的段都已被处理（FIFO 顺序即为保证，此处用于计数与后续扩展）。
-    Flush { token: u64 },
 }
 
 enum Job {
@@ -477,10 +475,6 @@ impl AsrEngine {
         true
     }
 
-    pub fn flush(&self, token: u64) {
-        self.queue.push_ctl(Ctl::Flush { token });
-    }
-
     /// 丢弃 recognizer，把内存还给系统；下次 `reload` 会重建。
     ///
     /// 用于"空闲太久"的场景（见 `lib.rs` 的 `IDLE_UNLOAD_DELAY`）：加载约 1 s，
@@ -569,9 +563,6 @@ fn decode_loop(queue: &'static DecodeQueue, env: DecodeEnv) {
                     recognizer.is_some(),
                     started.elapsed().as_millis()
                 );
-            }
-            Job::Ctl(Ctl::Flush { token }) => {
-                log::debug!("[rust] decode flush for token {token}");
             }
             Job::Seg(first) => {
                 // 批量收集：把队列里紧随其后的同代际段一起解，提高吞吐
@@ -668,7 +659,7 @@ fn decode_batch(
             continue;
         }
 
-        let Some(text) = pipeline.accept(&raw, job.seg.seam_overlap_ms, true) else {
+        let Some(text) = pipeline.accept(&raw, job.seg.seam_overlap_ms) else {
             s.rejected_text.fetch_add(1, Ordering::Relaxed);
             continue;
         };

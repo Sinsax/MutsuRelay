@@ -338,7 +338,7 @@ fn main() {
         let raw = stream.get_result().map(|r| r.text).unwrap_or_default();
         let before = pipeline.seam_trimmed;
         let seam = if args.seam { s.seam_overlap_ms } else { 0 };
-        let text = pipeline.accept(&raw, seam, true);
+        let text = pipeline.accept(&raw, seam);
         if pipeline.seam_trimmed > before {
             seam_trimmed += 1;
         }

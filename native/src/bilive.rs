@@ -66,6 +66,12 @@ pub struct Config {
     pub close_behavior: String,
     #[serde(default)]
     pub subtitle_file_path: String,
+    /// 单段时长上限（毫秒）。段长直接决定"最坏出字延迟"，所以放进配置可调。
+    #[serde(default = "default_segment_max_ms")]
+    pub segment_max_ms: u32,
+    /// 是否启用 interim（实时半句预览）。
+    #[serde(default = "default_interim")]
+    pub interim: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -82,6 +88,8 @@ fn default_censor_mode() -> i32 { 2 }
 fn default_noise_suppress() -> bool { true }
 fn default_language() -> String { "zh".to_string() }
 fn default_close_behavior() -> String { "hide".to_string() }
+fn default_segment_max_ms() -> u32 { crate::segmenter::DEFAULT_MAX_SEGMENT_MS }
+fn default_interim() -> bool { true }
 
 /// 全局 tokio Runtime 单例。
 ///

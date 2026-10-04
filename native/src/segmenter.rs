@@ -265,10 +265,6 @@ impl Segmenter {
         }
     }
 
-    pub fn processed_ms(&self) -> u64 {
-        samples_to_ms(self.processed_samples as usize)
-    }
-
     /// 当前段的时长（毫秒）。用于 interim 节流判断。
     pub fn current_segment_ms(&self) -> u64 {
         if !self.in_speech {
@@ -875,7 +871,6 @@ mod tests {
         s.reset();
         assert!(!s.in_speech());
         assert_eq!(s.current_segment_ms(), 0);
-        assert_eq!(s.processed_ms(), 0);
     }
 
     #[test]
