@@ -128,7 +128,10 @@ Compress-Archive -Path "build\windows\x64\runner\Release\*" -DestinationPath "di
 dart run fastforge:main package --platform linux --targets appimage
 ```
 
-CI 默认禁用（`.github/workflows/build.yml.disabled`），重命名为 `build.yml` 可启用自动构建+打包。
+CI（`.github/workflows/build.yml`）在推送到 `master` / `test` 时自动跑：analyze（`flutter analyze`
++ ABI 版本一致性 + `cargo check`）→ 分别构建 Windows（ZIP + Inno Setup 安装包）与 Linux
+（便携 ZIP + AppImage），产物以 artifact 形式上传；打 `v*` tag 时再发 Release。
+（历史上曾把该文件改名为 `build.yml.disabled` 来停用 CI；要再停用就改回去。）
 
 ## 使用
 

@@ -45,7 +45,12 @@ python native/tools/cer_baseline.py --only 07_quiet --no-denoise   # 单片段 A
   `generated_plugins.cmake`. Content is identical; with `core.autocrlf=true` git still shows them as
   modified (line endings only). `git checkout --` those 4 files after a run.
 - `cargo test` links a large sherpa-onnx/onnxruntime stack — run it in the background, it can exceed the foreground timeout.
-- CI (`.github/workflows/build.yml.disabled`): rename to `build.yml` to enable. Jobs: analyze → build-windows + build-linux (sequential deps, not parallel).
+- CI (`.github/workflows/build.yml`) is **enabled**: pushes to `master`/`test` run analyze
+  (flutter analyze + `check_abi.py` + `cargo check`) → build-windows + build-linux (sequential deps,
+  not parallel), and `v*` tags publish a Release. To disable it again, rename the file to
+  `build.yml.disabled` (that is how it was parked on 2026-06-10). Note ubuntu-24.04 package names:
+  `fuse`/`locate` no longer exist — the Linux job deliberately installs neither and runs
+  appimagetool with `APPIMAGE_EXTRACT_AND_RUN=1`.
 - Version single source of truth: `version:` in `pubspec.yaml`.
 
 ## C API versioning (important)

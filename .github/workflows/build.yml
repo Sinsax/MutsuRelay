@@ -33,6 +33,10 @@ jobs:
       - name: Flutter analyze
         run: flutter analyze
 
+      # 纯源码校验，不需要编译产物（也避免 require 到 sherpa-onnx 那套重链接）
+      - name: ABI version parity (lib.rs vs native_bridge.dart)
+        run: python3 native/tools/check_abi.py
+
       - name: Cargo check (Linux)
         working-directory: native
         run: cargo check
@@ -74,7 +78,12 @@ jobs:
         run: choco install innosetup --no-progress
 
       - name: Create Inno Setup installer
-        run: iscc /DMyAppVersion=${{ env.VERSION }} windows\installer\setup.iss
+        run: |
+          # 不依赖 choco shim 是否进了 PATH，直接按 Inno Setup 6 的安装路径调用
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { throw "找不到 $iscc" }
+          & $iscc "/DMyAppVersion=$env:VERSION" windows\installer\setup.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC 退出码 $LASTEXITCODE" }
 
       - name: Create ZIP package
         run: |
@@ -110,6 +119,9 @@ jobs:
       - name: Install Linux deps
         run: |
           sudo apt-get update
+          # 注意包名：ubuntu-24.04 上既没有 `fuse`（改为 libfuse2t64/fuse3）也没有 `locate`
+          # （由 plocate 提供）。这里两者都不需要 —— appimagetool 那一步用
+          # APPIMAGE_EXTRACT_AND_RUN=1 运行，不依赖 FUSE。
           sudo apt-get install -y --no-install-recommends \
             clang libclang-dev \
             libgtk-3-dev \
@@ -117,7 +129,7 @@ jobs:
             liblz4-dev \
             pkg-config \
             libayatana-appindicator3-dev \
-            fuse locate
+            zlib1g-dev
 
       - name: Cache ASR model
         uses: actions/cache@v4
